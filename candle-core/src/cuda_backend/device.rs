@@ -8,9 +8,37 @@ use half::{bf16, f16};
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
+
+/// Global device cache keyed by ordinal. `BackendDevice::new(ordinal)` returns
+/// the SAME CudaDevice instance (clone of) for repeated calls with the same
+/// ordinal, so engine and model code can never accidentally end up with two
+/// CudaDevice handles pointing at distinct streams/contexts. This is required
+/// for CUDA Graph capture — you can't capture across different streams.
+fn device_cache() -> &'static Mutex<HashMap<usize, CudaDevice>> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, CudaDevice>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop every cached CudaDevice. Each cached entry holds an
+/// `Arc<CudaContext>` (and Arc<CudaStream>, Arc<CudaBlas>, ...); as long
+/// as the cache keeps those Arcs alive the primary context cannot be
+/// released, so `cuMemPoolTrimTo` has nothing to give back to the OS.
+/// Call this on model unload AFTER all tensors and workspaces have been
+/// dropped, and BEFORE trimming the mempool.
+///
+/// If a CudaDevice clone is still held elsewhere (e.g., another engine's
+/// loaded model), the underlying context remains alive and only the
+/// cache's reference goes away. The cache will repopulate on the next
+/// `Device::new_cuda(ordinal)` call.
+pub fn clear_device_cache() {
+    let mtx = device_cache();
+    if let Ok(mut guard) = mtx.lock() {
+        guard.clear();
+    }
+}
 
 /// Unique identifier for cuda devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -62,6 +90,12 @@ pub struct CudaDevice {
     modules: Arc<std::sync::RwLock<ModuleStore>>,
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
+    /// Lazily-allocated secondary stream for opportunistic concurrent
+    /// execution (e.g., parallel-attn arches dispatching FFN ops alongside
+    /// the attn kernel chain). Initialized on first `alt_cuda_stream()`
+    /// call. Engine code is responsible for cudaEvent-based sync at any
+    /// data-dependency point.
+    alt_stream: Arc<OnceLock<Arc<cudarc::driver::CudaStream>>>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
@@ -251,6 +285,14 @@ impl CudaFunc {
     pub fn into_cuda_function(self) -> CudaFunction {
         self.func
     }
+
+    /// Borrow the underlying [`CudaFunction`] without consuming `self`.
+    /// CudaFunction is cheaply cloneable (Arc<CudaModule> + raw pointer);
+    /// the returned reference is suitable for launching on any
+    /// CudaStream via `stream.launch_builder(&func)`.
+    pub fn cuda_function(&self) -> &CudaFunction {
+        &self.func
+    }
 }
 
 #[macro_export]
@@ -273,6 +315,53 @@ impl CudaDevice {
     pub fn cuda_stream(&self) -> Arc<cudarc::driver::CudaStream> {
         self.stream.clone()
     }
+
+    /// Lazily-allocated non-blocking secondary stream. Returns the same
+    /// stream on every call after the first. Useful for opportunistic
+    /// concurrent execution of data-independent kernel chains within a
+    /// single forward pass (e.g., parallel-attn FFN overlap with attn).
+    ///
+    /// Engine code that uses this MUST cudaEvent-sync at any data
+    /// dependency point — there is no implicit ordering with `cuda_stream()`.
+    pub fn alt_cuda_stream(&self) -> Result<Arc<cudarc::driver::CudaStream>> {
+        if let Some(s) = self.alt_stream.get() {
+            return Ok(s.clone());
+        }
+        let new = self.context.new_stream().w()?;
+        // OnceLock semantics: first set wins; if a concurrent thread
+        // already populated, take theirs.
+        let _ = self.alt_stream.set(new);
+        Ok(self.alt_stream.get().unwrap().clone())
+    }
+
+    /// Create a fresh CUDA event tied to this device's context. Used for
+    /// cross-stream synchronization: record on one stream, wait from
+    /// another. Events created here have `CU_EVENT_DISABLE_TIMING` set
+    /// (lighter weight than timing events; we only need ordering).
+    pub fn new_event(&self) -> Result<cudarc::driver::CudaEvent> {
+        self.context.new_event(None).w()
+    }
+
+    /// Number of streaming multiprocessors on this CUDA device. Cached
+    /// after first query so the driver call cost amortises to zero.
+    /// Used for adaptive grid-sizing heuristics in tiny-batch GEMV /
+    /// quantize launches (saturate SMs without over-subscribing).
+    pub fn multiprocessor_count(&self) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CACHED: AtomicUsize = AtomicUsize::new(0);
+        let cached = CACHED.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        use cudarc::driver::sys;
+        let count: usize = self.context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .map(|v| v as usize)
+            .unwrap_or(64); // safe default — most modern GPUs ≥ 60 SMs
+        CACHED.store(count, Ordering::Relaxed);
+        count
+    }
+
 
     /// When turned on, all cuda tensors **created after calling this function** will
     /// not track uses via cuda events.
@@ -344,6 +433,8 @@ impl CudaDevice {
     }
 
     pub fn get_or_load_func(&self, fn_name: &str, mdl: &kernels::Module) -> Result<CudaFunc> {
+        // Multi-GPU: ensure this device's CUDA context is bound to the current thread
+        self.context.bind_to_thread().w()?;
         let ms = self.modules.read().unwrap();
         if let Some(mdl) = ms.mdls[mdl.index()].as_ref() {
             let func = mdl.load_function(fn_name).w()?;
@@ -388,6 +479,7 @@ impl CudaDevice {
             id: DeviceId::new(),
             context,
             stream,
+            alt_stream: Arc::new(OnceLock::new()),
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
@@ -401,6 +493,15 @@ impl BackendDevice for CudaDevice {
     type Storage = CudaStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        // Cache hit: return a clone (shares all Arc-backed state — same
+        // context, stream, modules — so capture across "two" Devices for
+        // the same GPU is now actually capture across the same stream).
+        {
+            let cache = device_cache().lock().unwrap();
+            if let Some(d) = cache.get(&ordinal) {
+                return Ok(d.clone());
+            }
+        }
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.per_thread_stream();
         Self::from_context_and_stream(context, stream)

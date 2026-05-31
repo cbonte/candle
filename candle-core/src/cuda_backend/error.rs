@@ -51,6 +51,19 @@ impl From<CudaError> for crate::Error {
     }
 }
 
+/// Lift cudarc DriverError directly into our Error so call sites using
+/// `?` against APIs that return `Result<_, DriverError>` (e.g.
+/// `dev.cuda_stream().context().bind_to_thread()?`) compile without
+/// the cudnn feature being enabled. The cudnn module had an
+/// equivalent impl gated behind `feature = "cudnn"`, which was the
+/// pre-existing reason `cargo test -p candle-core --features cuda`
+/// failed at `quantized/cuda.rs:1688` for non-cudnn builds.
+impl From<cudarc::driver::DriverError> for crate::Error {
+    fn from(err: cudarc::driver::DriverError) -> Self {
+        crate::Error::wrap(err)
+    }
+}
+
 pub trait WrapErr<O> {
     fn w(self) -> std::result::Result<O, crate::Error>;
 }

@@ -5,6 +5,7 @@ use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result};
 use half::f16;
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaView, DevicePtr, PushKernelArg, SyncOnDrop};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct PaddedCudaSlice {
@@ -42,6 +43,54 @@ fn ceil_div(p: usize, q: usize) -> usize {
 
 fn pad(p: usize, q: usize) -> usize {
     ceil_div(p, q) * q
+}
+
+/// Adaptive grid sizing for tiny-batch GEMV/quantize launches.
+///
+/// When the natural grid (num_blocks_x × grid_y) is smaller than the
+/// device's SM count, halve `block_dim_x` and double `grid_dim_x` until
+/// the SMs would be saturated. Caps at 64 threads/block (min two warps)
+/// and a 4x grid expansion. Source: SGLang Blackwell NVFP4 MoE blog +
+/// ggml-cuda mmvq launch helper.
+///
+/// `block_dim_x` must be a multiple of 32 (warp size) for kernels that
+/// use warp reductions. Returns the adjusted (block_x, grid_x) pair.
+fn adaptive_block_grid_x(
+    block_x: u32,
+    grid_x: u32,
+    grid_y: u32,
+    sm_count: u32,
+) -> (u32, u32) {
+    // Lower bound: 64 threads/block (2 warps; still safe for warp_reduce).
+    // Upper bound on expansion: 4x (avoid pathological tiny blocks).
+    const MIN_BLOCK_X: u32 = 64;
+    const MAX_EXPANSION: u32 = 4;
+    let mut block_x = block_x;
+    let mut grid_x = grid_x;
+    let mut expanded = 1u32;
+    while grid_x * grid_y < sm_count
+        && block_x > MIN_BLOCK_X
+        && expanded < MAX_EXPANSION
+    {
+        block_x /= 2;
+        grid_x *= 2;
+        expanded *= 2;
+    }
+    (block_x, grid_x)
+}
+
+/// Quantize F32 input to Q8_1 layout (32-byte block: 32 i8 quants + f16
+/// scale + f16 partial-sum). Public wrapper so consumers can pre-quantize
+/// once and feed the buffer into `mvq_via_pre_quantized_q8_1` for multiple
+/// matmuls against the same input (e.g., phi2 Q/K/V projections).
+pub fn quantize_q8_1_pub(
+    src: &CudaView<f32>,
+    dst: &mut CudaSlice<u8>,
+    k: usize,
+    ky: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    quantize_q8_1(src, dst, k, ky, dev)
 }
 
 fn quantize_q8_1(
@@ -83,9 +132,17 @@ fn quantize_q8_1(
         let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
         let dst_chunk = dst.slice(dst_start_byte..(dst_start_byte + dst_num_bytes));
 
+        // Adaptive grid sizing: when natural grid is < SM count,
+        // halve block / double grid to saturate SMs.
+        let (block_x, grid_x) = adaptive_block_grid_x(
+            CUDA_QUANTIZE_BLOCK_SIZE as u32,
+            num_blocks as u32,
+            rows_in_chunk as u32,
+            dev.multiprocessor_count() as u32,
+        );
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (num_blocks as u32, rows_in_chunk as u32, 1),
-            block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
+            grid_dim: (grid_x, rows_in_chunk as u32, 1),
+            block_dim: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
 
@@ -99,6 +156,1797 @@ fn quantize_q8_1(
     }
 
     Ok(())
+}
+
+/// GPU-native Q8_0 quantizer. Writes directly into a `PaddedCudaSlice`-shaped
+/// destination buffer (one `block_q8_0` per 32 source elements followed by
+/// MATRIX_ROW_PADDING worth of zero-filled blocks — the caller must zero
+/// the padding region before this call).
+///
+/// Source tensor is treated as `ky` rows of `k` elements each. The trailing
+/// `kx_padded - k` elements of each row are implicitly treated as 0 by the
+/// kernel, so they never contribute to the per-block amax.
+/// Quantize `src` (f32) into a pre-allocated destination buffer at a
+/// REPLAY-TIME slot index read from a device i32 pointer (`slot_dev[0]`).
+/// Required for CUDA graph capture of the Q8 KV append: the captured
+/// kernel reads the slot at replay, so the destination offset
+/// (`slot_dev[0] * num_blocks_per_token * 34`) advances correctly per
+/// token instead of being baked at capture time.
+///
+/// Same row-width / k-alignment constraint as `quantize_q8_0_f32_into_offset`
+/// (k must be a multiple of MATRIX_ROW_PADDING). Single-row decode only.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_q8_0_f32_dev_slot(
+    src: &CudaView<f32>,
+    dst: &mut CudaSlice<u8>,
+    slot_dev: &CudaSlice<i32>,
+    k: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    let q8_0_block_size = GgmlDType::Q8_0.block_size();
+    if !k.is_multiple_of(q8_0_block_size) {
+        crate::bail!("quantize_q8_0_f32_dev_slot: k {k} not a multiple of block size {q8_0_block_size}");
+    }
+    let kx_padded = pad(k, MATRIX_ROW_PADDING);
+    if kx_padded != k {
+        crate::bail!(
+            "quantize_q8_0_f32_dev_slot: k {k} must be a multiple of {MATRIX_ROW_PADDING}"
+        );
+    }
+    let num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
+    let num_blocks_per_token = kx_padded / q8_0_block_size;
+    if src.len() < k {
+        crate::bail!(
+            "quantize_q8_0_f32_dev_slot: src has {} elems, expected {} (k)", src.len(), k
+        );
+    }
+
+    let func = dev.get_or_load_func("quantize_q8_0_dev_slot", &candle_kernels::QUANTIZED)?;
+    let src_chunk = src.slice(0..k);
+
+    let (block_x, grid_x) = adaptive_block_grid_x(
+        CUDA_QUANTIZE_BLOCK_SIZE as u32,
+        num_blocks as u32,
+        1,
+        dev.multiprocessor_count() as u32,
+    );
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (block_x, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(&src_chunk);
+    builder.arg(dst);
+    builder.arg(slot_dev);
+    barg!(
+        builder,
+        k as i32,
+        kx_padded as i32,
+        num_blocks_per_token as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(())
+}
+
+/// Quantize `src` (f32) into a pre-allocated destination buffer at the
+/// caller-supplied byte offset. Skips the temporary CudaSlice + memcpy
+/// pattern used by `quantize_with_layout` + memcpy_dtod by writing the
+/// q8_0 blocks directly into the persistent destination at
+/// `dst[dst_byte_offset..]`. Used by the KV cache append to fold two
+/// launches (quantize-into-staging, memcpy-staging-to-buffer) into one.
+///
+/// `k` is elements per row (assumed n_kv_heads × head_dim for the
+/// single-row decode case). `k` MUST be a multiple of MATRIX_ROW_PADDING
+/// (512) — otherwise the kernel writes padding zeros into the slot
+/// after the current write, corrupting the next token's KV. This holds
+/// for common decode shapes (e.g. n_kv_heads×head_dim of 32×64, 2×512,
+/// 8×128); the caller should fall back to the staging-then-memcpy path
+/// when it doesn't.
+///
+/// Returns the number of bytes written: `(k / 32) × 34`.
+pub fn quantize_q8_0_f32_into_offset(
+    src: &CudaView<f32>,
+    dst: &mut CudaSlice<u8>,
+    dst_byte_offset: usize,
+    k: usize,
+    dev: &CudaDevice,
+) -> Result<usize> {
+    let q8_0_block_size = GgmlDType::Q8_0.block_size();
+    let q8_0_type_size = GgmlDType::Q8_0.type_size();
+    if !k.is_multiple_of(q8_0_block_size) {
+        crate::bail!("quantize_q8_0_f32_into_offset: k {k} not a multiple of block size {q8_0_block_size}");
+    }
+    let kx_padded = pad(k, MATRIX_ROW_PADDING);
+    if kx_padded != k {
+        crate::bail!(
+            "quantize_q8_0_f32_into_offset: k {k} must be a multiple of {MATRIX_ROW_PADDING} to skip padding write; \
+             callers needing arbitrary k must use the staging-then-memcpy path"
+        );
+    }
+    let num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
+    let dst_row_size_bytes = (kx_padded / q8_0_block_size) * q8_0_type_size;
+    let bytes_to_write = dst_row_size_bytes;
+
+    if dst_byte_offset + bytes_to_write > dst.len() {
+        crate::bail!(
+            "quantize_q8_0_f32_into_offset: write {} bytes at offset {} but dst is {} bytes",
+            bytes_to_write, dst_byte_offset, dst.len()
+        );
+    }
+    if src.len() < k {
+        crate::bail!(
+            "quantize_q8_0_f32_into_offset: src has {} elems, expected {} (k)",
+            src.len(), k
+        );
+    }
+
+    let func = dev.get_or_load_func("quantize_q8_0", &candle_kernels::QUANTIZED)?;
+    let src_chunk = src.slice(0..k);
+    let dst_chunk = dst.slice(dst_byte_offset..dst_byte_offset + bytes_to_write);
+
+    let (block_x, grid_x) = adaptive_block_grid_x(
+        CUDA_QUANTIZE_BLOCK_SIZE as u32,
+        num_blocks as u32,
+        1,
+        dev.multiprocessor_count() as u32,
+    );
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (block_x, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(&src_chunk);
+    builder.arg(&dst_chunk);
+    barg!(builder, k as i32, kx_padded as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(bytes_to_write)
+}
+
+/// Paired-K-and-V variant of `quantize_q8_0_f32_into_offset` — both quantize
+/// passes launched as one kernel (gridDim.z = 2). Single-token decode only;
+/// row width must satisfy the same alignment constraints as the single-side
+/// path. Saves one launch per layer at decode time.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_q8_0_kv_paired_into_offset(
+    src_k: &CudaView<f32>,
+    src_v: &CudaView<f32>,
+    dst_k: &mut CudaSlice<u8>,
+    dst_v: &mut CudaSlice<u8>,
+    dst_byte_offset: usize,
+    k: usize,
+    dev: &CudaDevice,
+) -> Result<usize> {
+    let q8_0_block_size = GgmlDType::Q8_0.block_size();
+    let q8_0_type_size = GgmlDType::Q8_0.type_size();
+    if !k.is_multiple_of(q8_0_block_size) {
+        crate::bail!(
+            "quantize_q8_0_kv_paired_into_offset: k {k} not multiple of {q8_0_block_size}"
+        );
+    }
+    let kx_padded = pad(k, MATRIX_ROW_PADDING);
+    if kx_padded != k {
+        crate::bail!(
+            "quantize_q8_0_kv_paired_into_offset: k {k} must be a multiple of {MATRIX_ROW_PADDING}"
+        );
+    }
+    let num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
+    let dst_row_size_bytes = (kx_padded / q8_0_block_size) * q8_0_type_size;
+    let bytes_to_write = dst_row_size_bytes;
+
+    if dst_byte_offset + bytes_to_write > dst_k.len()
+        || dst_byte_offset + bytes_to_write > dst_v.len()
+    {
+        crate::bail!(
+            "quantize_q8_0_kv_paired_into_offset: write {} bytes at offset {} but K dst is {} V dst is {}",
+            bytes_to_write, dst_byte_offset, dst_k.len(), dst_v.len()
+        );
+    }
+    if src_k.len() < k || src_v.len() < k {
+        crate::bail!(
+            "quantize_q8_0_kv_paired_into_offset: src has K={} V={} elems, expected {}",
+            src_k.len(), src_v.len(), k
+        );
+    }
+
+    let func = dev.get_or_load_func("quantize_q8_0_kv_paired", &candle_kernels::QUANTIZED)?;
+    let src_k_chunk = src_k.slice(0..k);
+    let src_v_chunk = src_v.slice(0..k);
+
+    let (block_x, grid_x) = adaptive_block_grid_x(
+        CUDA_QUANTIZE_BLOCK_SIZE as u32,
+        num_blocks as u32,
+        1,
+        dev.multiprocessor_count() as u32,
+    );
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (grid_x, 1, 2), // z=2 → one block group for K, one for V
+        block_dim: (block_x, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(&src_k_chunk);
+    builder.arg(&src_v_chunk);
+    builder.arg(&*dst_k);
+    builder.arg(&*dst_v);
+    barg!(builder, k as i32, kx_padded as i32, dst_byte_offset as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(bytes_to_write)
+}
+
+fn quantize_q8_0_f32(
+    src: &CudaView<f32>,
+    dst: &mut CudaSlice<u8>,
+    k: usize,
+    ky: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    let kx_padded = pad(k, MATRIX_ROW_PADDING);
+    let num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
+
+    let total_rows = ky;
+    let q8_0_block_size = GgmlDType::Q8_0.block_size();
+    let q8_0_type_size = GgmlDType::Q8_0.type_size();
+    let num_blocks_per_row = kx_padded / q8_0_block_size;
+    let dst_row_size_bytes = num_blocks_per_row * q8_0_type_size;
+
+    const CHUNK_SIZE: usize = 65535;
+    let func = dev.get_or_load_func("quantize_q8_0", &candle_kernels::QUANTIZED)?;
+
+    let mut rows_processed = 0;
+    while rows_processed < total_rows {
+        let remaining_rows = total_rows - rows_processed;
+        let rows_in_chunk = std::cmp::min(CHUNK_SIZE, remaining_rows);
+
+        let src_start_elem = rows_processed * k;
+        let src_num_elems = rows_in_chunk * k;
+        let src_chunk = src.slice(src_start_elem..(src_start_elem + src_num_elems));
+
+        let dst_start_byte = rows_processed * dst_row_size_bytes;
+        let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
+        let dst_chunk = dst.slice(dst_start_byte..(dst_start_byte + dst_num_bytes));
+
+        // Adaptive grid sizing: when natural grid is < SM count,
+        // halve block / double grid to saturate SMs.
+        let (block_x, grid_x) = adaptive_block_grid_x(
+            CUDA_QUANTIZE_BLOCK_SIZE as u32,
+            num_blocks as u32,
+            rows_in_chunk as u32,
+            dev.multiprocessor_count() as u32,
+        );
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_x, rows_in_chunk as u32, 1),
+            block_dim: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = func.builder();
+        builder.arg(&src_chunk);
+        builder.arg(&dst_chunk);
+        barg!(builder, k as i32, kx_padded as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        rows_processed += rows_in_chunk;
+    }
+
+    Ok(())
+}
+
+/// f16 variant of `quantize_q8_0_f32`. Avoids an f16→f32 cast + extra tensor
+/// allocation on the hot path when the source activations are already f16.
+fn quantize_q8_0_f16(
+    src: &CudaView<f16>,
+    dst: &mut CudaSlice<u8>,
+    k: usize,
+    ky: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    let kx_padded = pad(k, MATRIX_ROW_PADDING);
+    let num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
+
+    let total_rows = ky;
+    let q8_0_block_size = GgmlDType::Q8_0.block_size();
+    let q8_0_type_size = GgmlDType::Q8_0.type_size();
+    let num_blocks_per_row = kx_padded / q8_0_block_size;
+    let dst_row_size_bytes = num_blocks_per_row * q8_0_type_size;
+
+    const CHUNK_SIZE: usize = 65535;
+    let func = dev.get_or_load_func("quantize_q8_0_f16", &candle_kernels::QUANTIZED)?;
+
+    let mut rows_processed = 0;
+    while rows_processed < total_rows {
+        let remaining_rows = total_rows - rows_processed;
+        let rows_in_chunk = std::cmp::min(CHUNK_SIZE, remaining_rows);
+
+        let src_start_elem = rows_processed * k;
+        let src_num_elems = rows_in_chunk * k;
+        let src_chunk = src.slice(src_start_elem..(src_start_elem + src_num_elems));
+
+        let dst_start_byte = rows_processed * dst_row_size_bytes;
+        let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
+        let dst_chunk = dst.slice(dst_start_byte..(dst_start_byte + dst_num_bytes));
+
+        // Adaptive grid sizing: when natural grid is < SM count,
+        // halve block / double grid to saturate SMs.
+        let (block_x, grid_x) = adaptive_block_grid_x(
+            CUDA_QUANTIZE_BLOCK_SIZE as u32,
+            num_blocks as u32,
+            rows_in_chunk as u32,
+            dev.multiprocessor_count() as u32,
+        );
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_x, rows_in_chunk as u32, 1),
+            block_dim: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = func.builder();
+        builder.arg(&src_chunk);
+        builder.arg(&dst_chunk);
+        barg!(builder, k as i32, kx_padded as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        rows_processed += rows_in_chunk;
+    }
+
+    Ok(())
+}
+
+/// GPU-native Q4_0 quantizer (f32 source). Mirrors `quantize_q8_0_f32` but
+/// emits 18-byte blocks (1 half scale + 16 bytes of nibble-packed quants) for
+/// half the bytes per element. Used for KV cache storage at long contexts
+/// where the Q8_0 memory footprint doesn't fit.
+fn quantize_q4_0_f32(
+    src: &CudaView<f32>,
+    dst: &mut CudaSlice<u8>,
+    k: usize,
+    ky: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    let kx_padded = pad(k, MATRIX_ROW_PADDING);
+    let num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
+
+    let total_rows = ky;
+    let q4_0_block_size = GgmlDType::Q4_0.block_size();
+    let q4_0_type_size = GgmlDType::Q4_0.type_size();
+    let num_blocks_per_row = kx_padded / q4_0_block_size;
+    let dst_row_size_bytes = num_blocks_per_row * q4_0_type_size;
+
+    const CHUNK_SIZE: usize = 65535;
+    let func = dev.get_or_load_func("quantize_q4_0", &candle_kernels::QUANTIZED)?;
+
+    let mut rows_processed = 0;
+    while rows_processed < total_rows {
+        let remaining_rows = total_rows - rows_processed;
+        let rows_in_chunk = std::cmp::min(CHUNK_SIZE, remaining_rows);
+
+        let src_start_elem = rows_processed * k;
+        let src_num_elems = rows_in_chunk * k;
+        let src_chunk = src.slice(src_start_elem..(src_start_elem + src_num_elems));
+
+        let dst_start_byte = rows_processed * dst_row_size_bytes;
+        let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
+        let dst_chunk = dst.slice(dst_start_byte..(dst_start_byte + dst_num_bytes));
+
+        // Adaptive grid sizing: when natural grid is < SM count,
+        // halve block / double grid to saturate SMs.
+        let (block_x, grid_x) = adaptive_block_grid_x(
+            CUDA_QUANTIZE_BLOCK_SIZE as u32,
+            num_blocks as u32,
+            rows_in_chunk as u32,
+            dev.multiprocessor_count() as u32,
+        );
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_x, rows_in_chunk as u32, 1),
+            block_dim: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = func.builder();
+        builder.arg(&src_chunk);
+        builder.arg(&dst_chunk);
+        barg!(builder, k as i32, kx_padded as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        rows_processed += rows_in_chunk;
+    }
+
+    Ok(())
+}
+
+fn quantize_q4_0_f16(
+    src: &CudaView<f16>,
+    dst: &mut CudaSlice<u8>,
+    k: usize,
+    ky: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    let kx_padded = pad(k, MATRIX_ROW_PADDING);
+    let num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
+
+    let total_rows = ky;
+    let q4_0_block_size = GgmlDType::Q4_0.block_size();
+    let q4_0_type_size = GgmlDType::Q4_0.type_size();
+    let num_blocks_per_row = kx_padded / q4_0_block_size;
+    let dst_row_size_bytes = num_blocks_per_row * q4_0_type_size;
+
+    const CHUNK_SIZE: usize = 65535;
+    let func = dev.get_or_load_func("quantize_q4_0_f16", &candle_kernels::QUANTIZED)?;
+
+    let mut rows_processed = 0;
+    while rows_processed < total_rows {
+        let remaining_rows = total_rows - rows_processed;
+        let rows_in_chunk = std::cmp::min(CHUNK_SIZE, remaining_rows);
+
+        let src_start_elem = rows_processed * k;
+        let src_num_elems = rows_in_chunk * k;
+        let src_chunk = src.slice(src_start_elem..(src_start_elem + src_num_elems));
+
+        let dst_start_byte = rows_processed * dst_row_size_bytes;
+        let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
+        let dst_chunk = dst.slice(dst_start_byte..(dst_start_byte + dst_num_bytes));
+
+        // Adaptive grid sizing: when natural grid is < SM count,
+        // halve block / double grid to saturate SMs.
+        let (block_x, grid_x) = adaptive_block_grid_x(
+            CUDA_QUANTIZE_BLOCK_SIZE as u32,
+            num_blocks as u32,
+            rows_in_chunk as u32,
+            dev.multiprocessor_count() as u32,
+        );
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_x, rows_in_chunk as u32, 1),
+            block_dim: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = func.builder();
+        builder.arg(&src_chunk);
+        builder.arg(&dst_chunk);
+        barg!(builder, k as i32, kx_padded as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        rows_processed += rows_in_chunk;
+    }
+
+    Ok(())
+}
+
+/// Attention-score gemv: `Q @ K^T` where K is a Q8_0 blob (row-major over
+/// tokens, stride `n_kv_stride_blocks` block_q8_0 units) and Q is per-step
+/// queries on-device in f32.
+///
+/// Q is quantized to Q8_1 internally via the existing GPU quantize kernel
+/// before dispatch. Use this instead of `mul_mat_vec_via_q8_1` when k is
+/// small (head_dim 64/128/256) and n is large (up to 128K) — the generic
+/// gemv is tuned for large-k LLM weights and runs 5-7× slower than F16 at
+/// attention score shapes.
+///
+/// Returns a contiguous `float[b_size, n_kv]` tensor.
+///
+/// `n_kv_stride_blocks` allows striding between K rows when the caller
+/// packs a multi-kv-head cache as `[seq, n_kv_heads, head_dim]` — in that
+/// case pass `n_kv_heads * head_dim / 32` so the kernel hops over the
+/// sibling kv-heads of each token.
+pub fn attn_score_q8_0_q8_1_raw(
+    k_blob: &CudaSlice<u8>,
+    k_byte_offset: usize,
+    n_kv_stride_blocks: usize,
+    q_f32: &CudaView<f32>,
+    head_dim: usize,
+    n_kv: usize,
+    b_size: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!("attn_score_q8_0_q8_1: head_dim {head_dim} not a multiple of 32");
+    }
+    if q_f32.len() != b_size * head_dim {
+        crate::bail!(
+            "attn_score_q8_0_q8_1: q_f32 has {} elements, expected {}",
+            q_f32.len(),
+            b_size * head_dim
+        );
+    }
+
+    // Step 1: quantize Q to Q8_1 on-device (hot path allocation).
+    let k_padded = pad(head_dim, MATRIX_ROW_PADDING);
+    let q_q8_1_bytes =
+        k_padded * b_size * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+    let mut q_q8_1 = unsafe { dev.alloc::<u8>(q_q8_1_bytes)? };
+    quantize_q8_1(q_f32, &mut q_q8_1, head_dim, b_size, dev)?;
+    let kernel_name = match head_dim {
+        64 => "attn_score_q8_0_q8_1_hd64",
+        128 => "attn_score_q8_0_q8_1_hd128",
+        256 => "attn_score_q8_0_q8_1_hd256",
+        512 => "attn_score_q8_0_q8_1_hd512",
+        _ => crate::bail!(
+            "attn_score_q8_0_q8_1: unsupported head_dim {head_dim} (have 64/128/256/512)",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    // Q stride between consecutive batch rows, in `block_q8_1` units.
+    // `quantize_q8_1` pads each row up to MATRIX_ROW_PADDING elements, so
+    // the physical stride is (k_padded / block_size), not hd_blocks.
+    let b_stride_blocks = k_padded / GgmlDType::Q8_1.block_size();
+
+    // One warp per n row; batches iterate inside the kernel so K is loaded
+    // once per n and reused across all queries. With 4 warps per block, 128
+    // threads per block — good occupancy without over-subscribing regs.
+    const WARPS_PER_BLOCK: u32 = 4;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: ((n_kv as u32).div_ceil(WARPS_PER_BLOCK), 1, 1),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(b_size * n_kv)? };
+    // Slice K starting at the caller-supplied byte offset.
+    let k_slice = if k_byte_offset == 0 {
+        k_blob.slice(..)
+    } else {
+        k_blob.slice(k_byte_offset..)
+    };
+    let mut builder = func.builder();
+    builder.arg(&k_slice);
+    builder.arg(&q_q8_1);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        n_kv as i32,
+        n_kv_stride_blocks as i32,
+        b_stride_blocks as i32,
+        b_size as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// GQA variant: compute attention scores for **all** kv-heads in a single
+/// kernel launch.
+///
+/// K layout: `[seq_kv, n_kv_heads, head_dim]` as Q8_0 blocks — the packing
+/// used by `Q8KvCache`. Pass `n_kv_stride_blocks = n_kv_heads * head_dim / 32`
+/// (total token stride) and the function derives the per-kv-head offset
+/// internally.
+///
+/// Q layout: `[n_q_heads, head_dim]` f32 on-device. `n_q_heads` must equal
+/// `n_kv_heads * n_q_per_kv`. Q is quantized to Q8_1 once, re-used across
+/// all kv-heads.
+///
+/// Output: `float[n_q_heads, n_kv]` scores. Query head `h` corresponds to
+/// kv-head `h / n_q_per_kv`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_score_q8_0_q8_1_gqa(
+    k_blob: &CudaSlice<u8>,
+    q_f32: &CudaView<f32>,
+    head_dim: usize,
+    n_kv: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    // Backwards-compat: pass scale=1.0; callers should prefer
+    // attn_score_q8_0_q8_1_gqa_scaled to fold the 1/sqrt(d) scale
+    // into the kernel and skip the post-matmul affine launch.
+    attn_score_q8_0_q8_1_gqa_scaled(k_blob, q_f32, head_dim, n_kv, n_kv_heads, n_q_per_kv, 1.0f32, dev)
+}
+
+/// Same as `attn_score_q8_0_q8_1_gqa` but multiplies the output by
+/// `scale` in-kernel. Saves one `affine(scale, 0.0)` launch per
+/// attention call — at 64 layers × ~10µs/launch ≈ 0.64 ms/token
+/// savings with a Q8 KV cache.
+pub fn attn_score_q8_0_q8_1_gqa_scaled(
+    k_blob: &CudaSlice<u8>,
+    q_f32: &CudaView<f32>,
+    head_dim: usize,
+    n_kv: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    scale: f32,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!("attn_score_q8_0_q8_1_gqa: head_dim {head_dim} not a multiple of 32");
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if q_f32.len() != n_q_heads * head_dim {
+        crate::bail!(
+            "attn_score_q8_0_q8_1_gqa: q_f32 has {} elements, expected {}",
+            q_f32.len(),
+            n_q_heads * head_dim
+        );
+    }
+    let kernel_name = match head_dim {
+        64 => "attn_score_q8_0_q8_1_gqa_hd64",
+        128 => "attn_score_q8_0_q8_1_gqa_hd128",
+        256 => "attn_score_q8_0_q8_1_gqa_hd256",
+        512 => "attn_score_q8_0_q8_1_gqa_hd512",
+        _ => crate::bail!(
+            "attn_score_q8_0_q8_1_gqa: unsupported head_dim {head_dim} (have 64/128/256/512)",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    // Quantize Q to Q8_1 once for all kv-heads.
+    let k_padded = pad(head_dim, MATRIX_ROW_PADDING);
+    let q_q8_1_bytes =
+        k_padded * n_q_heads * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+    let mut q_q8_1 = unsafe { dev.alloc::<u8>(q_q8_1_bytes)? };
+    quantize_q8_1(q_f32, &mut q_q8_1, head_dim, n_q_heads, dev)?;
+
+    let hd_blocks = head_dim / 32;
+    let n_kv_stride_blocks = n_kv_heads * hd_blocks; // full token stride
+    let kv_head_stride_blocks = hd_blocks;
+    let q_stride_blocks = k_padded / GgmlDType::Q8_1.block_size();
+
+    const WARPS_PER_BLOCK: u32 = 4;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (
+            (n_kv as u32).div_ceil(WARPS_PER_BLOCK),
+            n_kv_heads as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * n_kv)? };
+    let mut builder = func.builder();
+    builder.arg(k_blob);
+    builder.arg(&q_q8_1);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        n_kv as i32,
+        n_kv_stride_blocks as i32,
+        kv_head_stride_blocks as i32,
+        q_stride_blocks as i32,
+        n_q_per_kv as i32,
+        scale
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Device-position variant of `attn_score_q8_0_q8_1_gqa` for CUDA graph
+/// capture mode.
+///
+/// Differences from the non-dev_pos version:
+///   - Reads `seq_kv` from a device i32 pointer (`seq_kv_dev`) instead of
+///     a host parameter. Host updates `seq_kv_dev` OUTSIDE the captured
+///     region each token.
+///   - Q is consumed as F32 directly — skips the `quantize_q8_1` step and
+///     the associated host-side alloc that breaks graph capture.
+///   - Writes scores into a `[n_q_heads, max_seq_padded]` buffer (stable
+///     stride across replays). Positions ≥ seq_kv get -INFINITY so
+///     `softmax_last_dim` masks them out.
+///
+/// Returns scores `[n_q_heads, max_seq_padded]` F32. Callers MUST keep
+/// `max_seq_padded` constant across all calls in one captured graph.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_score_q8_0_f32_dev_pos(
+    k_blob: &CudaSlice<u8>,
+    q_f32: &CudaView<f32>,
+    seq_kv_dev: &CudaSlice<i32>,
+    head_dim: usize,
+    max_seq_padded: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!(
+            "attn_score_q8_0_f32_dev_pos: head_dim {head_dim} not a multiple of 32"
+        );
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if q_f32.len() != n_q_heads * head_dim {
+        crate::bail!(
+            "attn_score_q8_0_f32_dev_pos: Q has {} elems, expected {}",
+            q_f32.len(),
+            n_q_heads * head_dim
+        );
+    }
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64,  1) => "attn_score_q8_0_f32_dev_pos_hd64_nq1",
+        (64,  2) => "attn_score_q8_0_f32_dev_pos_hd64_nq2",
+        (64,  4) => "attn_score_q8_0_f32_dev_pos_hd64_nq4",
+        (64,  5) => "attn_score_q8_0_f32_dev_pos_hd64_nq5",
+        (64,  8) => "attn_score_q8_0_f32_dev_pos_hd64_nq8",
+        (128, 1) => "attn_score_q8_0_f32_dev_pos_hd128_nq1",
+        (128, 2) => "attn_score_q8_0_f32_dev_pos_hd128_nq2",
+        (128, 4) => "attn_score_q8_0_f32_dev_pos_hd128_nq4",
+        (128, 5) => "attn_score_q8_0_f32_dev_pos_hd128_nq5",
+        (128, 8) => "attn_score_q8_0_f32_dev_pos_hd128_nq8",
+        (256, 1) => "attn_score_q8_0_f32_dev_pos_hd256_nq1",
+        (256, 2) => "attn_score_q8_0_f32_dev_pos_hd256_nq2",
+        (256, 4) => "attn_score_q8_0_f32_dev_pos_hd256_nq4",
+        (256, 5) => "attn_score_q8_0_f32_dev_pos_hd256_nq5",
+        (256, 8) => "attn_score_q8_0_f32_dev_pos_hd256_nq8",
+        _ => crate::bail!(
+            "attn_score_q8_0_f32_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv}) — supported {{64,128,256}} × {{1,2,4,5,8}}",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    // Each warp computes one (token, h_kv) and emits scores for all
+    // n_q_per_kv query heads in that kv-group.
+    const WARPS_PER_BLOCK: u32 = 4;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (
+            (max_seq_padded as u32).div_ceil(WARPS_PER_BLOCK),
+            n_kv_heads as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * max_seq_padded)? };
+    let mut builder = func.builder();
+    builder.arg(k_blob);
+    builder.arg(q_f32);
+    builder.arg(&dst);
+    builder.arg(seq_kv_dev);
+    barg!(
+        builder,
+        max_seq_padded as i32,
+        n_kv_heads as i32,
+        n_q_per_kv as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// V-path attention output: `out = probs @ V` where V is a Q8_0 cache laid
+/// out `[seq_kv, n_kv_heads, head_dim]` (same packing as `Q8KvCache`).
+///
+/// `probs` is f32 `[n_q_heads, seq_kv]` (softmax output). `n_q_heads` must
+/// equal `n_kv_heads * n_q_per_kv`. Returns f32 `[n_q_heads, head_dim]`.
+///
+/// The reduction is along `seq_kv`, orthogonal to Q8_0's head_dim block
+/// direction — so we can't reuse candle's standard `mul_mat_vec_q` kernels
+/// (which reduce along the block axis). Each lane owns one head_dim output
+/// and sweeps seq_kv internally.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_output_q8_0_f32_gqa(
+    v_blob: &CudaSlice<u8>,
+    probs_f32: &CudaView<f32>,
+    head_dim: usize,
+    seq_kv: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!("attn_output_q8_0_f32_gqa: head_dim {head_dim} not a multiple of 32");
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if probs_f32.len() != n_q_heads * seq_kv {
+        crate::bail!(
+            "attn_output_q8_0_f32_gqa: probs has {} elements, expected {}",
+            probs_f32.len(),
+            n_q_heads * seq_kv
+        );
+    }
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64, 1) => "attn_output_q8_0_f32_hd64_nq1",
+        (64, 2) => "attn_output_q8_0_f32_hd64_nq2",
+        (64, 4) => "attn_output_q8_0_f32_hd64_nq4",
+        (64, 5) => "attn_output_q8_0_f32_hd64_nq5",
+        (64, 8) => "attn_output_q8_0_f32_hd64_nq8",
+        (128, 1) => "attn_output_q8_0_f32_hd128_nq1",
+        (128, 2) => "attn_output_q8_0_f32_hd128_nq2",
+        (128, 4) => "attn_output_q8_0_f32_hd128_nq4",
+        (128, 5) => "attn_output_q8_0_f32_hd128_nq5",
+        (128, 8) => "attn_output_q8_0_f32_hd128_nq8",
+        (256, 1) => "attn_output_q8_0_f32_hd256_nq1",
+        (256, 2) => "attn_output_q8_0_f32_hd256_nq2",
+        (256, 4) => "attn_output_q8_0_f32_hd256_nq4",
+        (256, 5) => "attn_output_q8_0_f32_hd256_nq5",
+        (256, 8) => "attn_output_q8_0_f32_hd256_nq8",
+        (512, 1) => "attn_output_q8_0_f32_hd512_nq1",
+        (512, 2) => "attn_output_q8_0_f32_hd512_nq2",
+        (512, 4) => "attn_output_q8_0_f32_hd512_nq4",
+        (512, 5) => "attn_output_q8_0_f32_hd512_nq5",
+        (512, 8) => "attn_output_q8_0_f32_hd512_nq8",
+        _ => crate::bail!(
+            "attn_output_q8_0_f32_gqa: unsupported combo head_dim={head_dim} n_q_per_kv={n_q_per_kv} (want {{64,128,256,512}} × {{1,2,4,5,8}})",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    let hd_blocks = head_dim / 32;
+    let n_kv_stride_blocks = n_kv_heads * hd_blocks;
+    let kv_head_stride_blocks = hd_blocks;
+
+    // Keep this in lock-step with ATTN_OUTPUT_WARPS in the .cu file.
+    // qh is iterated inside the kernel so V is loaded once per (kv, block_idx)
+    // tile and reused across n_q_per_kv query heads — critical for GQA
+    // groups with n_q_per_kv > 1 (qwen3 = 4, qwen3-coder = 8, Llama-3 70B = 8).
+    const WARPS_PER_BLOCK: u32 = 32;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (hd_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let mut builder = func.builder();
+    builder.arg(v_blob);
+    builder.arg(probs_f32);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        seq_kv as i32,
+        n_kv_stride_blocks as i32,
+        kv_head_stride_blocks as i32,
+        n_q_per_kv as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Device-position variant of `attn_output_q8_0_f32_gqa` for CUDA graph
+/// capture mode.
+///
+/// Differences from the non-dev_pos version:
+///   - Reads `seq_kv` from a device i32 pointer (`seq_kv_dev`).
+///   - `probs` is laid out at the fixed `max_seq_padded` stride
+///     `[n_q_heads, max_seq_padded]`. Positions ≥ seq_kv MUST be zero
+///     (the softmax of attn_score_q8_0_f32_dev_pos guarantees this since
+///     those positions get -INFINITY scores).
+///   - V buffer and the output buffer pointers stay valid across replays
+///     when graph capture mode allocates them with stable addresses.
+///
+/// Returns `[n_q_heads, head_dim]` F32.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_output_q8_0_f32_dev_pos(
+    v_blob: &CudaSlice<u8>,
+    probs_f32: &CudaView<f32>,
+    seq_kv_dev: &CudaSlice<i32>,
+    head_dim: usize,
+    max_seq_padded: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!(
+            "attn_output_q8_0_f32_dev_pos: head_dim {head_dim} not a multiple of 32"
+        );
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if probs_f32.len() != n_q_heads * max_seq_padded {
+        crate::bail!(
+            "attn_output_q8_0_f32_dev_pos: probs has {} elements, expected {} ({} × {})",
+            probs_f32.len(),
+            n_q_heads * max_seq_padded,
+            n_q_heads,
+            max_seq_padded
+        );
+    }
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64,  1) => "attn_output_q8_0_f32_dev_pos_hd64_nq1",
+        (64,  2) => "attn_output_q8_0_f32_dev_pos_hd64_nq2",
+        (64,  4) => "attn_output_q8_0_f32_dev_pos_hd64_nq4",
+        (64,  5) => "attn_output_q8_0_f32_dev_pos_hd64_nq5",
+        (64,  8) => "attn_output_q8_0_f32_dev_pos_hd64_nq8",
+        (128, 1) => "attn_output_q8_0_f32_dev_pos_hd128_nq1",
+        (128, 2) => "attn_output_q8_0_f32_dev_pos_hd128_nq2",
+        (128, 4) => "attn_output_q8_0_f32_dev_pos_hd128_nq4",
+        (128, 5) => "attn_output_q8_0_f32_dev_pos_hd128_nq5",
+        (128, 8) => "attn_output_q8_0_f32_dev_pos_hd128_nq8",
+        (256, 1) => "attn_output_q8_0_f32_dev_pos_hd256_nq1",
+        (256, 2) => "attn_output_q8_0_f32_dev_pos_hd256_nq2",
+        (256, 4) => "attn_output_q8_0_f32_dev_pos_hd256_nq4",
+        (256, 5) => "attn_output_q8_0_f32_dev_pos_hd256_nq5",
+        (256, 8) => "attn_output_q8_0_f32_dev_pos_hd256_nq8",
+        _ => crate::bail!(
+            "attn_output_q8_0_f32_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv}) — supported {{64,128,256}} × {{1,2,4,5,8}}",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    let hd_blocks = head_dim / 32;
+    let n_kv_stride_blocks = n_kv_heads * hd_blocks;
+    let kv_head_stride_blocks = hd_blocks;
+
+    // Must match ATTN_OUTPUT_DEV_POS_WARPS in quantized.cu. Lower than
+    // the non-dev_pos `ATTN_OUTPUT_WARPS=32` because the dev_pos variant
+    // adds a device-memory seq_kv read + max_seq_padded indexing that
+    // tip per-thread register count past the 64-reg threshold needed for
+    // 1024-thread blocks on smaller compute caps.
+    const WARPS_PER_BLOCK: u32 = 16;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (hd_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let mut builder = func.builder();
+    builder.arg(v_blob);
+    builder.arg(probs_f32);
+    builder.arg(&dst);
+    builder.arg(seq_kv_dev);
+    barg!(
+        builder,
+        max_seq_padded as i32,
+        n_kv_stride_blocks as i32,
+        kv_head_stride_blocks as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Fused scale + softmax + V·attn for Q8 KV with device-side seq_kv.
+///
+/// Replaces the 3-launch chain of `affine(scale)` + `softmax_last_dim` +
+/// `attn_output_q8_0_f32_dev_pos` with one kernel that:
+///   - applies the 1/√head_dim scale in-register,
+///   - computes the row-wise softmax max + denom in warp 0,
+///   - re-reads raw scores and folds (scale + softmax) into the V multiply
+///     accumulate — no intermediate `probs` buffer allocated or written.
+///
+/// Inputs match the existing dev_pos contract: `scores` is shape
+/// `[n_q_heads, max_seq_padded]` with -INFINITY at positions ≥ seq_kv,
+/// and `seq_kv_dev[0]+1` gives the valid range. V blob layout is the
+/// same packed `[max_seq_padded, n_kv, head_dim]` Q8_0 the unfused
+/// `attn_output_q8_0_f32_dev_pos` reads.
+///
+/// Returns `[n_q_heads, head_dim]` F32.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_softmax_output_q8_0_f32_dev_pos(
+    v_blob: &CudaSlice<u8>,
+    scores_f32: &CudaView<f32>,
+    seq_kv_dev: &CudaSlice<i32>,
+    head_dim: usize,
+    max_seq_padded: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    scale: f32,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!(
+            "attn_softmax_output_q8_0_f32_dev_pos: head_dim {head_dim} not a multiple of 32"
+        );
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if scores_f32.len() != n_q_heads * max_seq_padded {
+        crate::bail!(
+            "attn_softmax_output_q8_0_f32_dev_pos: scores has {} elements, expected {} ({} × {})",
+            scores_f32.len(),
+            n_q_heads * max_seq_padded,
+            n_q_heads,
+            max_seq_padded
+        );
+    }
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64,  1) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq1",
+        (64,  2) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq2",
+        (64,  4) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq4",
+        (64,  5) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq5",
+        (64,  8) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq8",
+        (128, 1) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq1",
+        (128, 2) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq2",
+        (128, 4) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq4",
+        (128, 5) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq5",
+        (128, 8) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq8",
+        (256, 1) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq1",
+        (256, 2) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq2",
+        (256, 4) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq4",
+        (256, 5) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq5",
+        (256, 8) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq8",
+        _ => crate::bail!(
+            "attn_softmax_output_q8_0_f32_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv}) — supported {{64,128,256}} × {{1,2,4,5,8}}",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    let hd_blocks = head_dim / 32;
+    let n_kv_stride_blocks = n_kv_heads * hd_blocks;
+    let kv_head_stride_blocks = hd_blocks;
+
+    // Must match ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS in quantized.cu.
+    const WARPS_PER_BLOCK: u32 = 16;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (hd_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let mut builder = func.builder();
+    builder.arg(v_blob);
+    builder.arg(scores_f32);
+    builder.arg(&dst);
+    builder.arg(seq_kv_dev);
+    barg!(
+        builder,
+        max_seq_padded as i32,
+        n_kv_stride_blocks as i32,
+        kv_head_stride_blocks as i32,
+        scale
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Fully fused Q·K^T + scale + softmax + V·attn for Q8 KV cache, single
+/// query, n_q_per_kv=1. One launch replaces the
+/// `attn_score_q8_0_f32_dev_pos` + `attn_softmax_output_q8_0_f32_dev_pos`
+/// pair — keeps scores in registers (online softmax) instead of writing
+/// an `[n_q, max_seq_padded]` intermediate buffer. Targets phi2-class
+/// decode (HD=64 or 128, n_q==n_kv).
+///
+/// Returns out F32 `[n_q_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_fused_q8_decode_dev_pos(
+    k_blob: &CudaSlice<u8>,
+    v_blob: &CudaSlice<u8>,
+    q_f32: &CudaView<f32>,
+    seq_kv_dev: &CudaSlice<i32>,
+    head_dim: usize,
+    max_seq_padded: usize,
+    n_kv_heads: usize,
+    scale: f32,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !(head_dim == 64 || head_dim == 128) {
+        crate::bail!(
+            "attn_fused_q8_decode_dev_pos: head_dim {head_dim} not in {{64, 128}}"
+        );
+    }
+    let n_q_heads = n_kv_heads; // n_q_per_kv = 1
+    if q_f32.len() != n_q_heads * head_dim {
+        crate::bail!(
+            "attn_fused_q8_decode_dev_pos: Q has {} elems, expected {}",
+            q_f32.len(),
+            n_q_heads * head_dim
+        );
+    }
+    // v3: 16-warp design — each warp owns 1/16 of seq_kv with local
+    // (m, s, VKQ); cross-warp reduction at block end. Better GPU
+    // saturation than v2 (single-warp) at the cost of one __syncthreads
+    // at the end.
+    let kernel_name = match head_dim {
+        64  => "attn_fused_q8_decode_dev_pos_v3_hd64",
+        128 => "attn_fused_q8_decode_dev_pos_v3_hd128",
+        _   => unreachable!(),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (1, n_q_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, 16, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let mut builder = func.builder();
+    builder.arg(k_blob);
+    builder.arg(v_blob);
+    builder.arg(q_f32);
+    builder.arg(&dst);
+    builder.arg(seq_kv_dev);
+    barg!(
+        builder,
+        max_seq_padded as i32,
+        n_kv_heads as i32,
+        scale
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Q4_0 K-path attention score, KIVI layout.
+///
+/// K state is split between two buffers:
+///   - `k_blocks`: `[seq_blocks, n_kv, head_dim]` of 18-byte Q4_0 cells.
+///     Each cell holds 32 consecutive seq positions of one (head, channel).
+///   - `k_residual`: `[n_kv, head_dim, 32]` f16 — the not-yet-flushed
+///     partial seq block. Values at slot `s` correspond to seq position
+///     `full_blocks * 32 + s`.
+///
+/// Q is f32 `[n_q_heads, head_dim]`. Returns f32 `[n_q_heads, seq_kv]`
+/// scores covering the full `seq_kv` range (flushed blocks + residual).
+///
+/// The kernel handles the partial block internally — no separate host-side
+/// matmul + concat is needed. Grid dimension 0 covers `ceil(seq_kv/32)`
+/// blocks; the last block is the partial one when `seq_kv % 32 != 0`.
+#[allow(clippy::too_many_arguments)]
+/// Device-position variant — reads `seq_kv` from `seq_kv_dev[0]` instead
+/// of taking it as a host int, and writes scores into a fresh F32 buffer
+/// of constant `[n_q_heads, max_seq_padded]` layout. Positions ≥ seq_kv
+/// get -INFINITY so the downstream softmax masks them.
+///
+/// Required for CUDA graph capture of Q4-KV decode — host updates
+/// `seq_kv_dev` outside the captured region each token; the captured
+/// kernel launch sees the same i32 pointer and constant-sized output
+/// allocation on every replay. The output allocation reuses the
+/// cudaMallocAsync pool address under `enable_graph_capture_mode`,
+/// so the captured pointer stays valid across replays.
+///
+/// Returns scores `[n_q_heads, max_seq_padded]` F32. Callers MUST keep
+/// `max_seq_padded` constant across all calls in one captured graph.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_score_q4_0_f32_kivi_dev_pos(
+    k_blocks: &CudaSlice<u8>,
+    k_residual: &CudaSlice<f16>,
+    q_f32: &CudaView<f32>,
+    seq_kv_dev: &CudaSlice<i32>,
+    head_dim: usize,
+    max_seq_padded: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!("attn_score_q4_0_f32_kivi_dev_pos: head_dim {head_dim} not a multiple of 32");
+    }
+    if !max_seq_padded.is_multiple_of(32) {
+        crate::bail!(
+            "attn_score_q4_0_f32_kivi_dev_pos: max_seq_padded {max_seq_padded} not a multiple of 32"
+        );
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if q_f32.len() != n_q_heads * head_dim {
+        crate::bail!(
+            "attn_score_q4_0_f32_kivi_dev_pos: Q has {} elems, expected {}",
+            q_f32.len(),
+            n_q_heads * head_dim
+        );
+    }
+    // Grid covers max_seq_padded blocks. Kernel writes -INFINITY at
+    // positions ≥ seq_kv_dev[0] so softmax_last_dim masks them out.
+    let max_blocks = max_seq_padded / 32;
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64,  1) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq1",
+        (64,  2) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq2",
+        (64,  4) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq4",
+        (64,  5) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq5",
+        (64,  8) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq8",
+        (128, 1) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq1",
+        (128, 2) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq2",
+        (128, 4) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq4",
+        (128, 5) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq5",
+        (128, 8) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq8",
+        (256, 1) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq1",
+        (256, 2) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq2",
+        (256, 4) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq4",
+        (256, 5) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq5",
+        (256, 8) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq8",
+        (512, 1) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq1",
+        (512, 2) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq2",
+        (512, 4) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq4",
+        (512, 5) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq5",
+        (512, 8) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq8",
+        _ => crate::bail!(
+            "attn_score_q4_0_f32_kivi_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv})",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+    let n_warps: u32 = 16;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (max_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, n_warps, 1),
+        shared_mem_bytes: (n_warps * WARP_SIZE as u32 * 4) as u32,
+    };
+    // Fresh allocation each call — under CUDA graph capture mode the
+    // async pool returns the same address for identically-sized allocs,
+    // so the captured kernel argument stays valid across replays.
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * max_seq_padded)? };
+    let mut builder = func.builder();
+    builder.arg(k_blocks);
+    builder.arg(k_residual);
+    builder.arg(q_f32);
+    builder.arg(&dst);
+    builder.arg(seq_kv_dev);
+    barg!(
+        builder,
+        max_seq_padded as i32,
+        n_kv_heads as i32,
+        n_q_per_kv as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+pub fn attn_score_q4_0_f32_kivi(
+    k_blocks: &CudaSlice<u8>,
+    k_residual: &CudaSlice<f16>,
+    q_f32: &CudaView<f32>,
+    head_dim: usize,
+    seq_kv: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!("attn_score_q4_0_f32_kivi: head_dim {head_dim} not a multiple of 32");
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if q_f32.len() != n_q_heads * head_dim {
+        crate::bail!(
+            "attn_score_q4_0_f32_kivi: Q has {} elems, expected {}",
+            q_f32.len(),
+            n_q_heads * head_dim
+        );
+    }
+    let full_blocks = seq_kv / 32;
+    let total_blocks = seq_kv.div_ceil(32);
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64, 1) => "attn_score_q4_0_f32_kivi_hd64_nq1",
+        (64, 2) => "attn_score_q4_0_f32_kivi_hd64_nq2",
+        (64, 4) => "attn_score_q4_0_f32_kivi_hd64_nq4",
+        (64, 5) => "attn_score_q4_0_f32_kivi_hd64_nq5",
+        (64, 8) => "attn_score_q4_0_f32_kivi_hd64_nq8",
+        (128, 1) => "attn_score_q4_0_f32_kivi_hd128_nq1",
+        (128, 2) => "attn_score_q4_0_f32_kivi_hd128_nq2",
+        (128, 4) => "attn_score_q4_0_f32_kivi_hd128_nq4",
+        (128, 5) => "attn_score_q4_0_f32_kivi_hd128_nq5",
+        (128, 8) => "attn_score_q4_0_f32_kivi_hd128_nq8",
+        (256, 1) => "attn_score_q4_0_f32_kivi_hd256_nq1",
+        (256, 2) => "attn_score_q4_0_f32_kivi_hd256_nq2",
+        (256, 4) => "attn_score_q4_0_f32_kivi_hd256_nq4",
+        (256, 5) => "attn_score_q4_0_f32_kivi_hd256_nq5",
+        (256, 8) => "attn_score_q4_0_f32_kivi_hd256_nq8",
+        (512, 1) => "attn_score_q4_0_f32_kivi_hd512_nq1",
+        (512, 2) => "attn_score_q4_0_f32_kivi_hd512_nq2",
+        (512, 4) => "attn_score_q4_0_f32_kivi_hd512_nq4",
+        (512, 5) => "attn_score_q4_0_f32_kivi_hd512_nq5",
+        (512, 8) => "attn_score_q4_0_f32_kivi_hd512_nq8",
+        _ => crate::bail!(
+            "attn_score_q4_0_f32_kivi: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv})",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    // Grid = (total_blocks, n_kv_heads). Last block of the x axis is the
+    // partial residual block when seq_kv is not a multiple of 32; the
+    // kernel handles it via the `sb == full_blocks` path.
+    // N_WARPS=16: tested 4/8/16 on qwen3-coder and 16 won.
+    let n_warps: u32 = 16;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (total_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, n_warps, 1),
+        shared_mem_bytes: (n_warps * WARP_SIZE as u32 * 4) as u32,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * seq_kv)? };
+    let mut builder = func.builder();
+    builder.arg(k_blocks);
+    builder.arg(k_residual);
+    builder.arg(q_f32);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        seq_kv as i32,
+        full_blocks as i32,
+        n_kv_heads as i32,
+        n_q_per_kv as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Device-position variant of `attn_output_q4_0_f32_gqa`.
+///
+/// Reads `seq_kv` from `seq_kv_dev[0]` instead of taking it as a host
+/// int and reads `probs` from a fixed `[n_q_heads, max_seq_padded]`
+/// layout (matching the score kernel's output buffer). Writes a fresh
+/// `n_q_heads * head_dim` F32 buffer; under graph capture mode the
+/// cudaMallocAsync pool returns the same address each call.
+///
+/// Required for CUDA graph capture of Q4-KV decode: every pointer +
+/// stride captured by the launch is stable across replays; the only
+/// thing that changes between tokens is the i32 stored in `seq_kv_dev`,
+/// which the host writes outside the captured region.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_output_q4_0_f32_dev_pos(
+    v_blob: &CudaSlice<u8>,
+    probs_f32: &CudaView<f32>,
+    seq_kv_dev: &CudaSlice<i32>,
+    head_dim: usize,
+    max_seq_padded: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!("attn_output_q4_0_f32_dev_pos: head_dim {head_dim} not a multiple of 32");
+    }
+    if !max_seq_padded.is_multiple_of(32) {
+        crate::bail!(
+            "attn_output_q4_0_f32_dev_pos: max_seq_padded {max_seq_padded} not a multiple of 32"
+        );
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if probs_f32.len() != n_q_heads * max_seq_padded {
+        crate::bail!(
+            "attn_output_q4_0_f32_dev_pos: probs has {} elements, expected {} (n_q_heads * max_seq_padded)",
+            probs_f32.len(),
+            n_q_heads * max_seq_padded
+        );
+    }
+
+    let hd_blocks = head_dim / 32;
+    let n_kv_stride_blocks = n_kv_heads * hd_blocks;
+    let kv_head_stride_blocks = hd_blocks;
+
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64,  1) => "attn_output_q4_0_f32_dev_pos_hd64_nq1",
+        (64,  2) => "attn_output_q4_0_f32_dev_pos_hd64_nq2",
+        (64,  4) => "attn_output_q4_0_f32_dev_pos_hd64_nq4",
+        (64,  5) => "attn_output_q4_0_f32_dev_pos_hd64_nq5",
+        (64,  8) => "attn_output_q4_0_f32_dev_pos_hd64_nq8",
+        (128, 1) => "attn_output_q4_0_f32_dev_pos_hd128_nq1",
+        (128, 2) => "attn_output_q4_0_f32_dev_pos_hd128_nq2",
+        (128, 4) => "attn_output_q4_0_f32_dev_pos_hd128_nq4",
+        (128, 5) => "attn_output_q4_0_f32_dev_pos_hd128_nq5",
+        (128, 8) => "attn_output_q4_0_f32_dev_pos_hd128_nq8",
+        (256, 1) => "attn_output_q4_0_f32_dev_pos_hd256_nq1",
+        (256, 2) => "attn_output_q4_0_f32_dev_pos_hd256_nq2",
+        (256, 4) => "attn_output_q4_0_f32_dev_pos_hd256_nq4",
+        (256, 5) => "attn_output_q4_0_f32_dev_pos_hd256_nq5",
+        (256, 8) => "attn_output_q4_0_f32_dev_pos_hd256_nq8",
+        (512, 1) => "attn_output_q4_0_f32_dev_pos_hd512_nq1",
+        (512, 2) => "attn_output_q4_0_f32_dev_pos_hd512_nq2",
+        (512, 4) => "attn_output_q4_0_f32_dev_pos_hd512_nq4",
+        (512, 5) => "attn_output_q4_0_f32_dev_pos_hd512_nq5",
+        (512, 8) => "attn_output_q4_0_f32_dev_pos_hd512_nq8",
+        _ => crate::bail!(
+            "attn_output_q4_0_f32_dev_pos: unsupported combo head_dim={head_dim} n_q_per_kv={n_q_per_kv}",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    const WARPS_PER_BLOCK: u32 = 32;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (hd_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let mut builder = func.builder();
+    builder.arg(v_blob);
+    builder.arg(probs_f32);
+    builder.arg(&dst);
+    builder.arg(seq_kv_dev);
+    barg!(
+        builder,
+        max_seq_padded as i32,
+        n_kv_stride_blocks as i32,
+        kv_head_stride_blocks as i32,
+        n_q_per_kv as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Q4_0 variant of `attn_output_q8_0_f32_gqa`. Same call shape, V laid out
+/// `[seq_kv, n_kv_heads, head_dim]` in 18-byte Q4_0 blocks (half the byte
+/// count of Q8_0 for the same element count).
+///
+/// At seq_kv ≥ 8192 the dispatch switches to a split-K variant that
+/// scales blocks linearly with seq_kv (the monolithic 32-warp form
+/// under-saturates SMs at high ctx). Caller-transparent.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_output_q4_0_f32_gqa(
+    v_blob: &CudaSlice<u8>,
+    probs_f32: &CudaView<f32>,
+    head_dim: usize,
+    seq_kv: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!("attn_output_q4_0_f32_gqa: head_dim {head_dim} not a multiple of 32");
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if probs_f32.len() != n_q_heads * seq_kv {
+        crate::bail!(
+            "attn_output_q4_0_f32_gqa: probs has {} elements, expected {}",
+            probs_f32.len(),
+            n_q_heads * seq_kv
+        );
+    }
+
+    let hd_blocks = head_dim / 32;
+    let n_kv_stride_blocks = n_kv_heads * hd_blocks;
+    let kv_head_stride_blocks = hd_blocks;
+
+    // Split-K path: distributing the seq reduction
+    // across more blocks does NOT speed up this kernel because it is
+    // memory-bandwidth bound (reading the V cache once dominates),
+    // not parallelism-limited. Same wall-time at seq_kv=16k. Kept
+    // as code for future tuning; permanently off in production.
+    let splitk_threshold = usize::MAX;
+
+    if seq_kv >= splitk_threshold {
+        // Split-K path
+        let kernel_name = match (head_dim, n_q_per_kv) {
+            (64, 1) => "attn_output_q4_0_f32_splitk_hd64_nq1",
+            (64, 4) => "attn_output_q4_0_f32_splitk_hd64_nq4",
+            (64, 8) => "attn_output_q4_0_f32_splitk_hd64_nq8",
+            (128, 1) => "attn_output_q4_0_f32_splitk_hd128_nq1",
+            (128, 4) => "attn_output_q4_0_f32_splitk_hd128_nq4",
+            (128, 8) => "attn_output_q4_0_f32_splitk_hd128_nq8",
+            (256, 1) => "attn_output_q4_0_f32_splitk_hd256_nq1",
+            (256, 4) => "attn_output_q4_0_f32_splitk_hd256_nq4",
+            (256, 8) => "attn_output_q4_0_f32_splitk_hd256_nq8",
+            _ => crate::bail!(
+                "attn_output_q4_0_f32_gqa: unsupported splitk combo head_dim={head_dim} n_q_per_kv={n_q_per_kv}",
+            ),
+        };
+        let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+        let seq_per_split: usize = 256;
+        let s = (seq_kv + seq_per_split - 1) / seq_per_split;
+
+        const SPLITK_WARPS_PER_BLOCK: u32 = 8;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (hd_blocks as u32, n_kv_heads as u32, s as u32),
+            block_dim: (WARP_SIZE as u32, SPLITK_WARPS_PER_BLOCK, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // CRITICAL: split-K kernel atomicAdd's its partial; output must be zeroed.
+        let dst = dev.alloc_zeros::<f32>(n_q_heads * head_dim)?;
+        let mut builder = func.builder();
+        builder.arg(v_blob);
+        builder.arg(probs_f32);
+        builder.arg(&dst);
+        barg!(
+            builder,
+            seq_kv as i32,
+            n_kv_stride_blocks as i32,
+            kv_head_stride_blocks as i32,
+            seq_per_split as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
+
+    // Monolithic 32-warp path (short ctx)
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64, 1) => "attn_output_q4_0_f32_hd64_nq1",
+        (64, 2) => "attn_output_q4_0_f32_hd64_nq2",
+        (64, 4) => "attn_output_q4_0_f32_hd64_nq4",
+        (64, 5) => "attn_output_q4_0_f32_hd64_nq5",
+        (64, 8) => "attn_output_q4_0_f32_hd64_nq8",
+        (128, 1) => "attn_output_q4_0_f32_hd128_nq1",
+        (128, 2) => "attn_output_q4_0_f32_hd128_nq2",
+        (128, 4) => "attn_output_q4_0_f32_hd128_nq4",
+        (128, 5) => "attn_output_q4_0_f32_hd128_nq5",
+        (128, 8) => "attn_output_q4_0_f32_hd128_nq8",
+        (256, 1) => "attn_output_q4_0_f32_hd256_nq1",
+        (256, 2) => "attn_output_q4_0_f32_hd256_nq2",
+        (256, 4) => "attn_output_q4_0_f32_hd256_nq4",
+        (256, 5) => "attn_output_q4_0_f32_hd256_nq5",
+        (256, 8) => "attn_output_q4_0_f32_hd256_nq8",
+        (512, 1) => "attn_output_q4_0_f32_hd512_nq1",
+        (512, 2) => "attn_output_q4_0_f32_hd512_nq2",
+        (512, 4) => "attn_output_q4_0_f32_hd512_nq4",
+        (512, 5) => "attn_output_q4_0_f32_hd512_nq5",
+        (512, 8) => "attn_output_q4_0_f32_hd512_nq8",
+        _ => crate::bail!(
+            "attn_output_q4_0_f32_gqa: unsupported combo head_dim={head_dim} n_q_per_kv={n_q_per_kv}",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    const WARPS_PER_BLOCK: u32 = 32;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (hd_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let mut builder = func.builder();
+    builder.arg(v_blob);
+    builder.arg(probs_f32);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        seq_kv as i32,
+        n_kv_stride_blocks as i32,
+        kv_head_stride_blocks as i32,
+        n_q_per_kv as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// MVQ matmul with PRE-QUANTIZED q8_1 input. Same as the matmul step
+/// of `mul_mat_vec_via_q8_1` but skips the internal quantize_q8_1 — the
+/// caller has already produced the q8_1 buffer (e.g., via a fused
+/// rms_norm + quantize kernel). Saves one launch + one F32 roundtrip
+/// for the `wqkv` and `ffn_router` paths.
+///
+/// `y_q8_1` is the pre-quantized input as bytes; `qstor` is the
+/// quantized weight (Q4K/Q8_0/etc.). Returns F32 output [nrows].
+pub fn mvq_via_pre_quantized_q8_1(
+    qstor: &QCudaStorage,
+    y_q8_1: &CudaSlice<u8>,
+    ncols: usize,
+    nrows: usize,
+    b_size: usize,
+) -> Result<CudaStorage> {
+    let dev = &qstor.device;
+    if b_size == 0 || b_size > 8 {
+        crate::bail!("mvq_via_pre_quantized_q8_1: only bsize 1..=8, got {b_size}");
+    }
+    // Fast path: Q4_K decode (b_size=1) via tensor-core IMMA kernel.
+    // Replaces the dp4a inner loop with mma.sync.aligned.m16n8k32 — 16
+    // weight rows in parallel per 32-K chunk. ncols must be a multiple
+    // of 256 (one Q4_K super-block).
+    if b_size == 1
+        && qstor.dtype == GgmlDType::Q4K
+        && ncols.is_multiple_of(256)
+    {
+        extern "C" {
+            fn q4k_mmvq_imma(
+                vx: *const core::ffi::c_void,
+                vy: *const core::ffi::c_void,
+                dst: *mut core::ffi::c_void,
+                ncols_x: i32,
+                nrows_x: i32,
+                stream: i64,
+            );
+        }
+        use cudarc::driver::DevicePtr;
+        let stream = dev.cuda_stream();
+        let dst = unsafe { dev.alloc::<f32>(nrows)? };
+        let weights_ptr = qstor.data.inner.device_ptr(&stream).0 as *const core::ffi::c_void;
+        let input_ptr = y_q8_1.device_ptr(&stream).0 as *const core::ffi::c_void;
+        let dst_ptr = dst.device_ptr(&stream).0 as *mut core::ffi::c_void;
+        let stream_h = stream.cu_stream() as i64;
+        unsafe {
+            q4k_mmvq_imma(
+                weights_ptr,
+                input_ptr,
+                dst_ptr,
+                ncols as i32,
+                nrows as i32,
+                stream_h,
+            );
+        }
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
+    let kernel_name = match qstor.dtype {
+        GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_cuda",
+        GgmlDType::Q4_1 => "mul_mat_vec_q4_1_q8_1_cuda",
+        GgmlDType::Q5_0 => "mul_mat_vec_q5_0_q8_1_cuda",
+        GgmlDType::Q5_1 => "mul_mat_vec_q5_1_q8_1_cuda",
+        GgmlDType::Q8_0 => "mul_mat_vec_q8_0_q8_1_cuda",
+        GgmlDType::Q2K => "mul_mat_vec_q2_K_q8_1_cuda",
+        GgmlDType::Q3K => "mul_mat_vec_q3_K_q8_1_cuda",
+        GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_cuda",
+        GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_cuda",
+        GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
+        _ => crate::bail!("mvq_via_pre_quantized_q8_1: unsupported dtype {:?}", qstor.dtype),
+    };
+    let kernel_name = format!("{kernel_name}{b_size}");
+    let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
+    let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+    let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+    // Match the existing tuning: nwarps=2 for K-quant decode.
+    let (nblocks, nwarps) = match b_size {
+        1 => (nrows as u32, 2),
+        2..=4 => ((nrows as u32).div_ceil(2), 2),
+        5..=8 => ((nrows as u32).div_ceil(2), 2),
+        _ => crate::bail!("unexpected bsize {b_size}"),
+    };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nblocks, 1, 1),
+        block_dim: (WARP_SIZE as u32, nwarps, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(&qstor.data.inner);
+    builder.arg(y_q8_1);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        ncols as i32,
+        nrows as i32,
+        ncols_padded as i32,
+        nrows as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Fused softmax + Q4 attn output. Same as `attn_output_q4_0_f32_gqa`
+/// but takes RAW scores (post Q@K^T, post-scale) instead of probs;
+/// the kernel applies softmax inline. Saves one launch (the explicit
+/// softmax_last_dim) and the probs buffer roundtrip.
+pub fn attn_softmax_output_q4_0_f32_gqa(
+    v_blob: &CudaSlice<u8>,
+    scores_f32: &CudaView<f32>,
+    head_dim: usize,
+    seq_kv: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!("attn_softmax_output_q4_0_f32_gqa: head_dim {head_dim} not a multiple of 32");
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if scores_f32.len() != n_q_heads * seq_kv {
+        crate::bail!(
+            "attn_softmax_output_q4_0_f32_gqa: scores has {} elements, expected {}",
+            scores_f32.len(),
+            n_q_heads * seq_kv
+        );
+    }
+    // Pick the smallest compile-time NQ instantiation that fits the
+    // runtime n_q_per_kv. The kernel's inner loop has a
+    // `if (q < n_q_per_kv)` runtime guard, so dispatching to a larger
+    // NQ template instantiation just leaves unused lanes/accumulator
+    // slots idle — still correct, no extra memory traffic.
+    // Relaxed from exact-match {1,4,8} so models with
+    // n_q_per_kv ∈ {2,3,5,6,7} (e.g. qwen2 = 40/8 = 5,
+    // deepseek-r1:32b same) actually hit the fused path. Previously
+    // those silently fell through to the unfused 2-launch chain.
+    let nq_bucket = if n_q_per_kv <= 1 { 1 }
+        else if n_q_per_kv <= 4 { 4 }
+        else if n_q_per_kv <= 8 { 8 }
+        else {
+            crate::bail!(
+                "attn_softmax_output_q4_0_f32_gqa: n_q_per_kv={n_q_per_kv} > 8 not supported"
+            );
+        };
+    let kernel_name = match (head_dim, nq_bucket) {
+        (64, 1) => "attn_softmax_output_q4_0_f32_hd64_nq1",
+        (64, 4) => "attn_softmax_output_q4_0_f32_hd64_nq4",
+        (64, 8) => "attn_softmax_output_q4_0_f32_hd64_nq8",
+        (128, 1) => "attn_softmax_output_q4_0_f32_hd128_nq1",
+        (128, 4) => "attn_softmax_output_q4_0_f32_hd128_nq4",
+        (128, 8) => "attn_softmax_output_q4_0_f32_hd128_nq8",
+        (256, 1) => "attn_softmax_output_q4_0_f32_hd256_nq1",
+        (256, 4) => "attn_softmax_output_q4_0_f32_hd256_nq4",
+        (256, 8) => "attn_softmax_output_q4_0_f32_hd256_nq8",
+        _ => crate::bail!(
+            "attn_softmax_output_q4_0_f32_gqa: unsupported head_dim={head_dim}",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    let hd_blocks = head_dim / 32;
+    let n_kv_stride_blocks = n_kv_heads * hd_blocks;
+    let kv_head_stride_blocks = hd_blocks;
+
+    const WARPS_PER_BLOCK: u32 = 32;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (hd_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let mut builder = func.builder();
+    builder.arg(v_blob);
+    builder.arg(scores_f32);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        seq_kv as i32,
+        n_kv_stride_blocks as i32,
+        kv_head_stride_blocks as i32,
+        n_q_per_kv as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Q8 sibling of attn_softmax_output_q4_0_f32_gqa. Fuses softmax(scores)
+/// with the V matmul into a single kernel launch.
+pub fn attn_softmax_output_q8_0_f32_gqa(
+    v_blob: &CudaSlice<u8>,
+    scores_f32: &CudaView<f32>,
+    head_dim: usize,
+    seq_kv: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!("attn_softmax_output_q8_0_f32_gqa: head_dim {head_dim} not a multiple of 32");
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if scores_f32.len() != n_q_heads * seq_kv {
+        crate::bail!(
+            "attn_softmax_output_q8_0_f32_gqa: scores has {} elements, expected {}",
+            scores_f32.len(),
+            n_q_heads * seq_kv
+        );
+    }
+    let nq_bucket = if n_q_per_kv <= 1 { 1 }
+        else if n_q_per_kv <= 4 { 4 }
+        else if n_q_per_kv <= 8 { 8 }
+        else {
+            crate::bail!(
+                "attn_softmax_output_q8_0_f32_gqa: n_q_per_kv={n_q_per_kv} > 8 not supported"
+            );
+        };
+    let kernel_name = match (head_dim, nq_bucket) {
+        (64, 1) => "attn_softmax_output_q8_0_f32_hd64_nq1",
+        (64, 4) => "attn_softmax_output_q8_0_f32_hd64_nq4",
+        (64, 8) => "attn_softmax_output_q8_0_f32_hd64_nq8",
+        (128, 1) => "attn_softmax_output_q8_0_f32_hd128_nq1",
+        (128, 4) => "attn_softmax_output_q8_0_f32_hd128_nq4",
+        (128, 8) => "attn_softmax_output_q8_0_f32_hd128_nq8",
+        _ => crate::bail!(
+            "attn_softmax_output_q8_0_f32_gqa: unsupported head_dim={head_dim}",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    let hd_blocks = head_dim / 32;
+    let n_kv_stride_blocks = n_kv_heads * hd_blocks;
+    let kv_head_stride_blocks = hd_blocks;
+
+    const WARPS_PER_BLOCK: u32 = 32;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (hd_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let mut builder = func.builder();
+    builder.arg(v_blob);
+    builder.arg(scores_f32);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        seq_kv as i32,
+        n_kv_stride_blocks as i32,
+        kv_head_stride_blocks as i32,
+        n_q_per_kv as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Convenience: call the attention-score gemv against a pre-built QCudaStorage
+/// K. Assumes the K cache is laid out row-major over tokens with stride
+/// `head_dim / 32` blocks (the layout produced by calling `QTensor::quantize`
+/// on a `[seq, head_dim]` tensor).
+pub fn attn_score_q8_0_q8_1(
+    k: &QCudaStorage,
+    q_f32: &CudaView<f32>,
+    head_dim: usize,
+    n_kv: usize,
+    b_size: usize,
+) -> Result<CudaStorage> {
+    if k.dtype != GgmlDType::Q8_0 {
+        crate::bail!("attn_score_q8_0_q8_1: K must be Q8_0, got {:?}", k.dtype);
+    }
+    let hd_blocks = head_dim / 32;
+    attn_score_q8_0_q8_1_raw(
+        &k.data.inner,
+        0,
+        hd_blocks,
+        q_f32,
+        head_dim,
+        n_kv,
+        b_size,
+        &k.device,
+    )
 }
 
 fn dequantize_f32(
@@ -158,6 +2006,214 @@ fn dequantize_f32(
         barg!(builder, nb32 as i32);
         unsafe { builder.launch(cfg) }.w()?;
     }
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Dequantize a Q8_0 byte blob straight to an F16 CudaStorage. Intended
+/// for callers that hold a raw `CudaSlice<u8>` of Q8_0 blocks (for
+/// example a KV cache that owns the storage directly rather than via a
+/// QCudaStorage/QTensor) and need an f16 view for downstream attention
+/// kernels (like flash-attn) that don't consume quantized inputs.
+///
+/// `elem_count` is the logical (dequantized) element count — must be a
+/// multiple of 32 (Q8_0 block size).
+pub fn dequantize_q8_0_blob_f16(
+    data: &CudaSlice<u8>,
+    elem_count: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !elem_count.is_multiple_of(32) {
+        crate::bail!("dequantize_q8_0_blob_f16: elem_count {elem_count} must be multiple of 32");
+    }
+    let nb = elem_count.div_ceil(256);
+    let func = dev.get_or_load_func("dequantize_block_q8_0_f16", &candle_kernels::QUANTIZED)?;
+    let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nb as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nb32 = (elem_count / 32) as i32;
+    let mut builder = func.builder();
+    builder.arg(data);
+    builder.arg(&dst);
+    barg!(builder, nb32);
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Dequantize a Q4_0 byte blob to F16. Mirror of `dequantize_q8_0_blob_f16`
+/// for the Q4 KV cache: each 18-byte block becomes 32 F16 elements. Used by
+/// the "dequant then standard attention" fallback path until the fused Q4
+/// attention kernels land.
+/// Per-expert Q4_K → F16 dequantize for the MoE expert
+/// weight tensor `[num_experts, rows, cols]`. Offsets into the underlying
+/// quantized byte blob by `expert_idx × (rows × cols / 256) × 144`
+/// (sizeof(block_q4_K) = 144) and launches the existing
+/// `dequantize_block_q4_K_f16` kernel on just that slab. Returns the
+/// dequantized F16 storage of shape `[rows × cols]`.
+///
+/// `cols` must be a multiple of `QK_K = 256`. Used by the per-expert
+/// dispatch in moe_gemm_gguf_*: caller dequantizes the
+/// experts that have at least one token assigned, then launches a
+/// cuBLAS GEMM per expert. The dequantize workspace is per-call;
+/// re-use across experts within a layer requires the caller to
+/// allocate one buffer of size `rows × cols × 2 bytes`.
+/// Same as `dequantize_q4k_expert_f16` but writes into an existing F16
+/// destination buffer (`out_f16_ptr`, capacity ≥ `rows_per_expert × cols`
+/// elements). Use this to avoid the per-call allocation churn when
+/// iterating over many experts. The first variant (returns a new
+/// CudaStorage) wraps this with one fresh alloc.
+pub fn dequantize_q4k_expert_into_f16(
+    data_ptr: u64,
+    data_len_bytes: usize,
+    expert_idx: usize,
+    rows_per_expert: usize,
+    cols: usize,
+    out_f16_ptr: u64,
+    dev: &CudaDevice,
+) -> Result<()> {
+    use cudarc::driver::sys::cuMemcpyDtoDAsync_v2;
+    use cudarc::driver::DevicePtr;
+
+    const QK_K_LOCAL: usize = 256;
+    const BLOCK_Q4K_BYTES: usize = 144;
+    if !cols.is_multiple_of(QK_K_LOCAL) {
+        crate::bail!(
+            "dequantize_q4k_expert_into_f16: cols {cols} must be a multiple of {QK_K_LOCAL}"
+        );
+    }
+    let elem_count = rows_per_expert * cols;
+    let blocks_per_expert = elem_count / QK_K_LOCAL;
+    let expert_bytes = blocks_per_expert * BLOCK_Q4K_BYTES;
+    let expert_off_bytes = expert_idx * expert_bytes;
+    if expert_off_bytes + expert_bytes > data_len_bytes {
+        crate::bail!(
+            "dequantize_q4k_expert_into_f16: expert {expert_idx} offset+len {} > data {}",
+            expert_off_bytes + expert_bytes, data_len_bytes
+        );
+    }
+
+    let nb = blocks_per_expert;
+    let func = dev.get_or_load_func("dequantize_block_q4_K_f16", &candle_kernels::QUANTIZED)?;
+
+    dev.cuda_stream().context().bind_to_thread()?;
+    let scratch_alloc = unsafe { dev.alloc::<u8>(expert_bytes) }?;
+    let src_ptr = data_ptr + expert_off_bytes as u64;
+    let dst_scratch_ptr = scratch_alloc.device_ptr(scratch_alloc.stream()).0;
+    let stream_ptr = dev.cuda_stream().cu_stream();
+    unsafe {
+        let st = cuMemcpyDtoDAsync_v2(
+            dst_scratch_ptr,
+            src_ptr,
+            expert_bytes,
+            stream_ptr,
+        );
+        if st != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            crate::bail!("dequantize_q4k_expert_into_f16: cuMemcpyDtoDAsync {:?}", st);
+        }
+    }
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nb as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // The kernel takes (input_blocks, output_f16). Bind via raw pointer
+    // for the output side — we don't own a CudaSlice<f16> here.
+    let mut builder = func.builder();
+    builder.arg(&scratch_alloc);
+    builder.arg(&out_f16_ptr);
+    unsafe { builder.launch(cfg) }
+        .map_err(|e| crate::Error::Msg(format!("dequantize_q4k_expert_into_f16 launch: {e}")))?;
+    Ok(())
+}
+
+pub fn dequantize_q4k_expert_f16(
+    data_ptr: u64,
+    data_len_bytes: usize,
+    expert_idx: usize,
+    rows_per_expert: usize,
+    cols: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    use cudarc::driver::sys::cuMemcpyDtoDAsync_v2;
+    use cudarc::driver::DevicePtr;
+
+    const QK_K_LOCAL: usize = 256;
+    const BLOCK_Q4K_BYTES: usize = 144; // sizeof(block_q4_K)
+    if !cols.is_multiple_of(QK_K_LOCAL) {
+        crate::bail!(
+            "dequantize_q4k_expert_f16: cols {cols} must be a multiple of {QK_K_LOCAL}"
+        );
+    }
+    let elem_count = rows_per_expert * cols;
+    let blocks_per_expert = elem_count / QK_K_LOCAL;
+    let expert_bytes = blocks_per_expert * BLOCK_Q4K_BYTES;
+    let expert_off_bytes = expert_idx * expert_bytes;
+    if expert_off_bytes + expert_bytes > data_len_bytes {
+        crate::bail!(
+            "dequantize_q4k_expert_f16: expert {expert_idx} offset+len {} > data {}",
+            expert_off_bytes + expert_bytes, data_len_bytes
+        );
+    }
+
+    let nb = blocks_per_expert;
+    let func = dev.get_or_load_func("dequantize_block_q4_K_f16", &candle_kernels::QUANTIZED)?;
+    let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+
+    dev.cuda_stream().context().bind_to_thread()?;
+    let scratch_alloc = unsafe { dev.alloc::<u8>(expert_bytes) }?;
+    let src_ptr = data_ptr + expert_off_bytes as u64;
+    let dst_scratch_ptr = scratch_alloc.device_ptr(scratch_alloc.stream()).0;
+    let stream_ptr = dev.cuda_stream().cu_stream();
+    unsafe {
+        let st = cuMemcpyDtoDAsync_v2(
+            dst_scratch_ptr,
+            src_ptr,
+            expert_bytes,
+            stream_ptr,
+        );
+        if st != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            crate::bail!("dequantize_q4k_expert_f16: cuMemcpyDtoDAsync {:?}", st);
+        }
+    }
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nb as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(&scratch_alloc);
+    builder.arg(&dst);
+    unsafe { builder.launch(cfg) }
+        .map_err(|e| crate::Error::Msg(format!("dequantize_q4k_expert_f16 launch: {e}")))?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+pub fn dequantize_q4_0_blob_f16(
+    data: &CudaSlice<u8>,
+    elem_count: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !elem_count.is_multiple_of(32) {
+        crate::bail!("dequantize_q4_0_blob_f16: elem_count {elem_count} must be multiple of 32");
+    }
+    let nb = elem_count.div_ceil(256);
+    let func = dev.get_or_load_func("dequantize_block_q4_0_f16", &candle_kernels::QUANTIZED)?;
+    let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nb as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nb32 = (elem_count / 32) as i32;
+    let mut builder = func.builder();
+    builder.arg(data);
+    builder.arg(&dst);
+    barg!(builder, nb32);
+    unsafe { builder.launch(cfg) }.w()?;
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
@@ -290,8 +2346,43 @@ fn mul_mat_vec_via_q8_1(
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
     quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
+
+    // Fast path: Q4_K decode (b_size=1) via tensor-core IMMA.
+    if b_size == 1
+        && dtype == GgmlDType::Q4K
+        && ncols.is_multiple_of(256)
+    {
+        extern "C" {
+            fn q4k_mmvq_imma(
+                vx: *const core::ffi::c_void,
+                vy: *const core::ffi::c_void,
+                dst: *mut core::ffi::c_void,
+                ncols_x: i32,
+                nrows_x: i32,
+                stream: i64,
+            );
+        }
+        use cudarc::driver::DevicePtr;
+        let stream = dev.cuda_stream();
+        let dst = unsafe { dev.alloc::<f32>(nrows)? };
+        let weights_ptr = data.inner.device_ptr(&stream).0 as *const core::ffi::c_void;
+        let input_ptr = y_q8_1.device_ptr(&stream).0 as *const core::ffi::c_void;
+        let dst_ptr = dst.device_ptr(&stream).0 as *mut core::ffi::c_void;
+        let stream_h = stream.cu_stream() as i64;
+        unsafe {
+            q4k_mmvq_imma(
+                weights_ptr,
+                input_ptr,
+                dst_ptr,
+                ncols as i32,
+                nrows as i32,
+                stream_h,
+            );
+        }
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
 
     let kernel_name = match dtype {
         GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_cuda",
@@ -308,11 +2399,16 @@ fn mul_mat_vec_via_q8_1(
     };
     let kernel_name = format!("{kernel_name}{b_size}");
     let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
-    let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
+    let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
+    // Lowered nwarps from 4 to 2 for b_size 1..=4 — better SM
+    // occupancy on K-quant decode shapes (K=2048 leaves 75% threads
+    // idle in a 4-warp block; 2 warps doubles block count and
+    // matches the kernel's reduced template constant).
+    // Confirmed: nwarps=4 (matching ggml) is ~17% slower on RTX 5070 Ti.
     let (nblocks, nwarps) = match b_size {
-        1 => (nrows as u32, 4),
-        2..=4 => ((nrows as u32).div_ceil(2), 4),
+        1 => (nrows as u32, 2),
+        2..=4 => ((nrows as u32).div_ceil(2), 2),
         5..=8 => ((nrows as u32).div_ceil(2), 2),
         _ => crate::bail!("unexpected bsize {b_size}"),
     };
@@ -363,7 +2459,7 @@ fn mul_mat_via_q8_1(
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         k_padded * y_cols * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
     quantize_q8_1(y, &mut y_q8_1, k, y_cols, dev)?;
 
     let (kernel_name, mmq_x, mmq_y) = match dtype {
@@ -380,7 +2476,7 @@ fn mul_mat_via_q8_1(
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
-    let dst = dev.alloc_zeros::<f32>(x_rows * y_cols)?;
+    let dst = unsafe { dev.alloc::<f32>(x_rows * y_cols)? };
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (
             ceil_div(x_rows, mmq_y) as u32,
@@ -436,14 +2532,14 @@ fn indexed_moe_forward_fused_q8_1_input(
     let num_blocks_per_row = k_padded / q8_1_block_size;
     let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
     let y_size_in_bytes = total_rows * dst_row_size_bytes;
-    let mut input_quant = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
 
     let input_view = input.slice(0..);
     quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
 
     // output buffer
     let outsize = batch * topk * n;
-    let out = dev.alloc_zeros::<f32>(outsize)?;
+    let out = unsafe { dev.alloc::<f32>(outsize)? };
 
     let kernel_name = match w_dtype {
         GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
@@ -550,6 +2646,13 @@ impl QCudaStorage {
         &self.device
     }
 
+    /// Raw row-padded quantized weight buffer, for out-of-tree kernel launchers
+    /// that drive the quantized GEMM/GEMV kernels themselves (paired with
+    /// [`Self::dtype`]).
+    pub fn weight_cuda_slice(&self) -> &CudaSlice<u8> {
+        &self.data.inner
+    }
+
     pub fn dequantize(&self, elem_count: usize) -> Result<CudaStorage> {
         fn deq<T: GgmlType>(buffer: &[u8], n: usize, dst: &mut [f32]) {
             let slice = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const T, n) };
@@ -597,6 +2700,7 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
+            GgmlDType::MxFp4 => deq::<crate::quantized::BlockMxFp4>(&buffer, block_len, &mut out),
         }
 
         self.device
@@ -607,8 +2711,143 @@ impl QCudaStorage {
         dequantize_f16(&self.data, self.dtype, elem_count, self.device())
     }
 
+    /// Like `quantize(&src)` but respects the source tensor's layout —
+    /// specifically the `start_offset` and element count implied by the
+    /// layout's shape. The plain `quantize` reads from raw storage offset
+    /// 0 with `src.data.len()` elements, which is wrong when `src` is a
+    /// view into a larger storage (`narrow`, `slice`, etc.). Callers that
+    /// have a `Tensor` should prefer this variant.
+    pub fn quantize_with_layout(
+        &mut self,
+        src: &CudaStorage,
+        layout: &crate::Layout,
+    ) -> Result<()> {
+        let offset = layout.start_offset();
+        let elem_count = layout.shape().elem_count();
+
+        // Q8_0 / Q4_0 share a fast path: GPU-native quantize kernels that
+        // read the source layout directly into a PaddedCudaSlice, without
+        // the dtoh→quantize→htod roundtrip the CPU fallback does. Both are
+        // used by the KV cache on every decode step, so avoiding the host
+        // stall is the point of the fast path.
+        if self.dtype == GgmlDType::Q8_0 || self.dtype == GgmlDType::Q4_0 {
+            let is_q4 = self.dtype == GgmlDType::Q4_0;
+            let block_size = self.dtype.block_size();
+            let type_size = self.dtype.type_size();
+            if !elem_count.is_multiple_of(block_size) {
+                crate::bail!(
+                    "quantize_{}: element count {elem_count} is not divisible by block size {block_size}",
+                    if is_q4 { "q4_0" } else { "q8_0" },
+                );
+            }
+            let unpadded_bytes = (elem_count / block_size) * type_size;
+            let padded_bytes =
+                unpadded_bytes + MATRIX_ROW_PADDING * type_size / block_size;
+            let mut inner = if self.data.inner.len() == padded_bytes {
+                std::mem::replace(
+                    &mut self.data.inner,
+                    self.device.alloc_zeros::<u8>(0)?,
+                )
+            } else {
+                self.device.alloc_zeros::<u8>(padded_bytes)?
+            };
+
+            match (&src.slice, is_q4) {
+                (crate::cuda_backend::CudaStorageSlice::F32(data), false) => {
+                    let view = data.slice(offset..offset + elem_count);
+                    quantize_q8_0_f32(&view, &mut inner, elem_count, 1, &self.device)?;
+                }
+                (crate::cuda_backend::CudaStorageSlice::F16(data), false) => {
+                    let view = data.slice(offset..offset + elem_count);
+                    quantize_q8_0_f16(&view, &mut inner, elem_count, 1, &self.device)?;
+                }
+                (crate::cuda_backend::CudaStorageSlice::F32(data), true) => {
+                    let view = data.slice(offset..offset + elem_count);
+                    quantize_q4_0_f32(&view, &mut inner, elem_count, 1, &self.device)?;
+                }
+                (crate::cuda_backend::CudaStorageSlice::F16(data), true) => {
+                    let view = data.slice(offset..offset + elem_count);
+                    quantize_q4_0_f16(&view, &mut inner, elem_count, 1, &self.device)?;
+                }
+                _ => crate::bail!(
+                    "quantize_{}: unsupported source dtype (expected f32 or f16)",
+                    if is_q4 { "q4_0" } else { "q8_0" },
+                ),
+            }
+
+            self.data = PaddedCudaSlice {
+                inner,
+                len: unpadded_bytes,
+            };
+            return Ok(());
+        }
+
+        // Other GGML dtypes fall through to the legacy CPU-roundtrip path.
+        // Slight quirk: the CPU path below reads `data.len()` and therefore
+        // ignores the layout. For the KV-cache use case we only care about
+        // Q8_0 / Q4_0 on the fast path above, so this is fine for now.
+        self.quantize(src)
+    }
+
     pub fn quantize(&mut self, src: &CudaStorage) -> Result<()> {
-        // Run the quantization on cpu.
+        // GPU-native fast path: Q8_0 can be produced directly on-device by a
+        // small CUDA kernel, skipping the dtoh→quantize→htod roundtrip that
+        // would otherwise stall every write. Other formats still fall back
+        // to the CPU path below.
+        if self.dtype == GgmlDType::Q8_0 {
+            let elem_count = match &src.slice {
+                crate::cuda_backend::CudaStorageSlice::F32(data) => data.len(),
+                crate::cuda_backend::CudaStorageSlice::F16(data) => data.len(),
+                _ => crate::bail!("quantize_q8_0: unsupported source dtype (expected f32 or f16)"),
+            };
+            let block_size = self.dtype.block_size();
+            let type_size = self.dtype.type_size();
+            if !elem_count.is_multiple_of(block_size) {
+                crate::bail!(
+                    "quantize_q8_0: element count {elem_count} is not divisible by block size {block_size}",
+                );
+            }
+            // PaddedCudaSlice::len holds the unpadded byte count (what dequant expects).
+            // The backing `inner` is oversized by one padding row per quantization
+            // block so trailing partial blocks don't read OOB.
+            let unpadded_bytes = (elem_count / block_size) * type_size;
+            let padded_bytes =
+                unpadded_bytes + MATRIX_ROW_PADDING * type_size / block_size;
+            // Reuse the existing allocation if it is exactly the right size:
+            // this is the per-step fast path (e.g., a KV cache re-quantizing
+            // one new token every decode step) where a fresh cudaMalloc
+            // would cost ~tens of µs and scales with device memory pressure.
+            // Exact-size match keeps the padding region's zero-init intact
+            // without needing a device-side memset.
+            let mut inner = if self.data.inner.len() == padded_bytes {
+                std::mem::replace(
+                    &mut self.data.inner,
+                    self.device.alloc_zeros::<u8>(0)?,
+                )
+            } else {
+                self.device.alloc_zeros::<u8>(padded_bytes)?
+            };
+
+            // Treat the entire tensor as one "row" of `elem_count` elements.
+            // The kernel pads the row up to kx_padded = ceil(k, 512) internally.
+            match &src.slice {
+                crate::cuda_backend::CudaStorageSlice::F32(data) => {
+                    quantize_q8_0_f32(&data.slice(..), &mut inner, elem_count, 1, &self.device)?;
+                }
+                crate::cuda_backend::CudaStorageSlice::F16(data) => {
+                    quantize_q8_0_f16(&data.slice(..), &mut inner, elem_count, 1, &self.device)?;
+                }
+                _ => unreachable!(),
+            }
+
+            self.data = PaddedCudaSlice {
+                inner,
+                len: unpadded_bytes,
+            };
+            return Ok(());
+        }
+
+        // Fallback: run the quantization on cpu.
         let src = match &src.slice {
             crate::cuda_backend::CudaStorageSlice::F32(data) => self.device.clone_dtoh(data)?,
             _ => crate::bail!("only f32 can be quantized"),
@@ -756,6 +2995,32 @@ impl QCudaStorage {
         Ok(out)
     }
 
+    /// Reference to the underlying device-side u8 slice (padded). Lets
+    /// external callers (e.g. integration tests for the score / output
+    /// dev_pos kernels in `tests/quantized_tests.rs`) reach into the
+    /// QCudaStorage without hand-rolling host round-trips. The slice is
+    /// padded to MATRIX_ROW_PADDING — use `data()` if you need the
+    /// trimmed contents instead.
+    pub fn cuda_slice(&self) -> &cudarc::driver::CudaSlice<u8> {
+        &self.data.inner
+    }
+
+    /// Device-side view of the unpadded Q8 bytes. Used by callers that
+    /// want to memcpy the freshly-quantized data into a larger persistent
+    /// buffer (e.g., a Q8 KV cache) without round-tripping through host.
+    pub fn data_slice_for_copy<'a>(
+        &'a self,
+        byte_len: usize,
+    ) -> Result<cudarc::driver::CudaView<'a, u8>> {
+        if byte_len > self.data.len {
+            crate::bail!(
+                "data_slice_for_copy: byte_len {byte_len} exceeds unpadded length {}",
+                self.data.len
+            );
+        }
+        Ok(self.data.inner.slice(..byte_len))
+    }
+
     pub fn device_ptr(&self) -> Result<*const u8> {
         Ok(self.data.inner.device_ptr(self.data.inner.stream()).0 as *const u8)
     }
@@ -867,6 +3132,7 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     };
     let dtype = T::DTYPE;
     let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
+    // Use alloc_zeros to ensure padding bytes are initialized to zero.
     let mut inner = device.alloc_zeros::<u8>(padded_len)?;
     device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
     Ok(QStorage::Cuda(QCudaStorage {
@@ -999,4 +3265,314 @@ mod test {
         let _vs = dev.clone_dtoh(&vs.as_view())?;
         Ok(())
     }
+}
+
+/// F-dtype (F16 KV) dev_pos attn_score launcher. Mirrors
+/// `attn_score_q8_0_f32_dev_pos` but for the F16 SpecKvCache layout
+/// `[b=1, n_kv, max_seq, head_dim]` contiguous. Q is F32. Returns scores
+/// F32 `[n_q_heads, max_seq_padded]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_score_f16_f32_dev_pos(
+    k_f16: &CudaView<f16>,
+    q_f32: &CudaView<f32>,
+    seq_kv_dev: &CudaSlice<i32>,
+    head_dim: usize,
+    max_seq_padded: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!(
+            "attn_score_f16_f32_dev_pos: head_dim {head_dim} not a multiple of 32"
+        );
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if q_f32.len() != n_q_heads * head_dim {
+        crate::bail!(
+            "attn_score_f16_f32_dev_pos: Q has {} elems, expected {}",
+            q_f32.len(),
+            n_q_heads * head_dim
+        );
+    }
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64,  1) => "attn_score_f16_f32_dev_pos_hd64_nq1",
+        (64,  2) => "attn_score_f16_f32_dev_pos_hd64_nq2",
+        (64,  4) => "attn_score_f16_f32_dev_pos_hd64_nq4",
+        (64,  8) => "attn_score_f16_f32_dev_pos_hd64_nq8",
+        (128, 1) => "attn_score_f16_f32_dev_pos_hd128_nq1",
+        (128, 2) => "attn_score_f16_f32_dev_pos_hd128_nq2",
+        (128, 4) => "attn_score_f16_f32_dev_pos_hd128_nq4",
+        (128, 8) => "attn_score_f16_f32_dev_pos_hd128_nq8",
+        (256, 1) => "attn_score_f16_f32_dev_pos_hd256_nq1",
+        _ => crate::bail!(
+            "attn_score_f16_f32_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv}) — supported {{64,128}} × {{1,2,4,8}} + (256,1)",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    const WARPS_PER_BLOCK: u32 = 4;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (
+            (max_seq_padded as u32).div_ceil(WARPS_PER_BLOCK),
+            n_kv_heads as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * max_seq_padded)? };
+    let mut builder = func.builder();
+    builder.arg(k_f16);
+    builder.arg(q_f32);
+    builder.arg(&dst);
+    builder.arg(seq_kv_dev);
+    barg!(
+        builder,
+        max_seq_padded as i32,
+        n_kv_heads as i32,
+        n_q_per_kv as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// F-dtype (F16 KV) dev_pos fused softmax + V·attn launcher. Mirrors
+/// `attn_softmax_output_q8_0_f32_dev_pos`. V layout same as K above.
+/// Returns out F32 `[n_q_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_softmax_output_f16_f32_dev_pos(
+    v_f16: &CudaView<f16>,
+    scores_f32: &CudaView<f32>,
+    seq_kv_dev: &CudaSlice<i32>,
+    head_dim: usize,
+    max_seq_padded: usize,
+    n_kv_heads: usize,
+    n_q_per_kv: usize,
+    scale: f32,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !head_dim.is_multiple_of(32) {
+        crate::bail!(
+            "attn_softmax_output_f16_f32_dev_pos: head_dim {head_dim} not a multiple of 32"
+        );
+    }
+    let n_q_heads = n_kv_heads * n_q_per_kv;
+    if scores_f32.len() != n_q_heads * max_seq_padded {
+        crate::bail!(
+            "attn_softmax_output_f16_f32_dev_pos: scores has {} elements, expected {} ({} × {})",
+            scores_f32.len(),
+            n_q_heads * max_seq_padded,
+            n_q_heads,
+            max_seq_padded
+        );
+    }
+    let kernel_name = match (head_dim, n_q_per_kv) {
+        (64,  1) => "attn_softmax_output_f16_f32_dev_pos_hd64_nq1",
+        (64,  2) => "attn_softmax_output_f16_f32_dev_pos_hd64_nq2",
+        (64,  4) => "attn_softmax_output_f16_f32_dev_pos_hd64_nq4",
+        (64,  8) => "attn_softmax_output_f16_f32_dev_pos_hd64_nq8",
+        (128, 1) => "attn_softmax_output_f16_f32_dev_pos_hd128_nq1",
+        (128, 2) => "attn_softmax_output_f16_f32_dev_pos_hd128_nq2",
+        (128, 4) => "attn_softmax_output_f16_f32_dev_pos_hd128_nq4",
+        (128, 8) => "attn_softmax_output_f16_f32_dev_pos_hd128_nq8",
+        (256, 1) => "attn_softmax_output_f16_f32_dev_pos_hd256_nq1",
+        _ => crate::bail!(
+            "attn_softmax_output_f16_f32_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv}) — supported {{64,128}} × {{1,2,4,8}} + (256,1)",
+        ),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    let hd_blocks = head_dim / 32;
+    // Must match ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS in quantized.cu.
+    const WARPS_PER_BLOCK: u32 = 16;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (hd_blocks as u32, n_kv_heads as u32, 1),
+        block_dim: (WARP_SIZE as u32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let mut builder = func.builder();
+    builder.arg(v_f16);
+    builder.arg(scores_f32);
+    builder.arg(&dst);
+    builder.arg(seq_kv_dev);
+    barg!(
+        builder,
+        max_seq_padded as i32,
+        n_kv_heads as i32,
+        scale
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// fast_mmvq plain kernel direct-call wrappers. Used to bypass the buggy
+// IMMA path in `mvq_via_pre_quantized_q8_1` (q4k_mmvq_imma produces
+// Inf/NaN at large nrows e.g. phi2's fused QKV [6144, 2048]).
+//
+// These replicate fast_mmvq::try_fwd's exact kernel invocation pattern
+// (the working path that QMatMul.forward uses) but split into quantize
+// and matmul phases so callers can share a single Q8_1 buffer across
+// multiple matmuls.
+// ─────────────────────────────────────────────────────────────────────────
+
+const FAST_MMVQ_Q8_1_BLOCK_SIZE: usize = 32;
+const FAST_MMVQ_Q8_1_TYPE_SIZE: usize = 36;
+
+/// Quantize F32 input to Q8_1 using the fast_mmvq kernel layout.
+/// Output buffer must be `(k_padded / 32) * 36` bytes.
+pub fn quantize_q8_1_fast_mmvq_f32(
+    src: &CudaView<f32>,
+    out_q8_1: &mut CudaSlice<u8>,
+    k: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    quantize_q8_1_fast_mmvq_f32_on_stream(src, out_q8_1, k, &dev.cuda_stream())
+}
+
+/// Stream-parameterized variant of `quantize_q8_1_fast_mmvq_f32`.
+pub fn quantize_q8_1_fast_mmvq_f32_on_stream(
+    src: &CudaView<f32>,
+    out_q8_1: &mut CudaSlice<u8>,
+    k: usize,
+    stream: &Arc<cudarc::driver::CudaStream>,
+) -> Result<()> {
+    use cudarc::driver::DevicePtr;
+    let k_padded = pad(k, MATRIX_ROW_PADDING);
+    let src_ptr = src.device_ptr(stream).0 as *const std::ffi::c_void;
+    let out_ptr = out_q8_1.device_ptr(stream).0 as *mut std::ffi::c_void;
+    let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+    unsafe {
+        candle_kernels::ffi::launch_mmvq_gguf_quantize_q8_1_f32(
+            src_ptr,
+            out_ptr,
+            k as i32,
+            k_padded as i32,
+            1,
+            stream_ptr,
+        );
+    }
+    let _ = (FAST_MMVQ_Q8_1_BLOCK_SIZE, FAST_MMVQ_Q8_1_TYPE_SIZE);
+    Ok(())
+}
+
+/// Q4_K matmul using fast_mmvq's plain kernel, taking a pre-quantized
+/// Q8_1 buffer. Bypasses the buggy IMMA path. Returns F32 `[nrows]`.
+pub fn mvq_plain_q4_k_via_shared_q8_1(
+    qstor: &QCudaStorage,
+    q8_1_buf: &CudaSlice<u8>,
+    ncols: usize,
+    nrows: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    use cudarc::driver::DevicePtr;
+    if qstor.dtype != GgmlDType::Q4K {
+        crate::bail!(
+            "mvq_plain_q4_k_via_shared_q8_1: only Q4_K supported, got {:?}",
+            qstor.dtype
+        );
+    }
+    let k_padded = pad(ncols, MATRIX_ROW_PADDING);
+    let stride_col_y = (k_padded / FAST_MMVQ_Q8_1_BLOCK_SIZE) as i32;
+    let stride_col_dst = nrows as i32;
+
+    let dst = unsafe { dev.alloc::<f32>(nrows)? };
+    let stream = dev.cuda_stream();
+    let weight_ptr = qstor.data.inner.device_ptr(&stream).0 as *const std::ffi::c_void;
+    let q8_1_ptr   = q8_1_buf.device_ptr(&stream).0 as *const std::ffi::c_void;
+    let dst_ptr    = dst.device_ptr(&stream).0 as *mut std::ffi::c_void;
+    let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+
+    unsafe {
+        candle_kernels::ffi::launch_mmvq_gguf_q4_k_f32_plain(
+            weight_ptr,
+            q8_1_ptr,
+            dst_ptr,
+            ncols as i32,
+            nrows as i32,
+            stride_col_y,
+            stride_col_dst,
+            1,
+            stream_ptr,
+        );
+    }
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Generic plain-kernel mvq via shared Q8_1 buffer. Dispatches to the
+/// dtype-specific fast_mmvq plain kernel. Supports Q4_0, Q4_K, Q5_K,
+/// Q6_K, Q8_0. Returns F32 `[nrows]`.
+pub fn mvq_plain_any_via_shared_q8_1(
+    qstor: &QCudaStorage,
+    q8_1_buf: &CudaSlice<u8>,
+    ncols: usize,
+    nrows: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    mvq_plain_any_via_shared_q8_1_on_stream(
+        qstor, q8_1_buf, ncols, nrows, dev, &dev.cuda_stream(),
+    )
+}
+
+/// Stream-parameterized variant — launches the mvq kernel on the supplied
+/// CudaStream instead of the device's default. Allocations on the dst
+/// buffer go through the same stream so they are properly ordered.
+///
+/// Caller is responsible for any cross-stream synchronization (the inputs
+/// must already be ready on `stream` — typically by replaying the dep on
+/// it via `stream.wait(event)` after the producer recorded the event).
+#[allow(clippy::too_many_arguments)]
+pub fn mvq_plain_any_via_shared_q8_1_on_stream(
+    qstor: &QCudaStorage,
+    q8_1_buf: &CudaSlice<u8>,
+    ncols: usize,
+    nrows: usize,
+    dev: &CudaDevice,
+    stream: &Arc<cudarc::driver::CudaStream>,
+) -> Result<CudaStorage> {
+    use cudarc::driver::DevicePtr;
+    let k_padded = pad(ncols, MATRIX_ROW_PADDING);
+    let stride_col_y = (k_padded / FAST_MMVQ_Q8_1_BLOCK_SIZE) as i32;
+    let stride_col_dst = nrows as i32;
+
+    // Allocate the dst on the SAME stream as the kernel — `dev.alloc` uses
+    // the default stream which would create a cross-stream dependency.
+    let dst = unsafe { stream.alloc::<f32>(nrows) }.w()?;
+    let weight_ptr = qstor.data.inner.device_ptr(stream).0 as *const std::ffi::c_void;
+    let q8_1_ptr   = q8_1_buf.device_ptr(stream).0 as *const std::ffi::c_void;
+    let dst_ptr    = dst.device_ptr(stream).0 as *mut std::ffi::c_void;
+    let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+
+    unsafe {
+        match qstor.dtype {
+            GgmlDType::Q4_0 => candle_kernels::ffi::launch_mmvq_gguf_q4_0_f32_plain(
+                weight_ptr, q8_1_ptr, dst_ptr, ncols as i32, nrows as i32,
+                stride_col_y, stride_col_dst, 1, stream_ptr,
+            ),
+            GgmlDType::Q4K => candle_kernels::ffi::launch_mmvq_gguf_q4_k_f32_plain(
+                weight_ptr, q8_1_ptr, dst_ptr, ncols as i32, nrows as i32,
+                stride_col_y, stride_col_dst, 1, stream_ptr,
+            ),
+            GgmlDType::Q5K => candle_kernels::ffi::launch_mmvq_gguf_q5_k_f32_plain(
+                weight_ptr, q8_1_ptr, dst_ptr, ncols as i32, nrows as i32,
+                stride_col_y, stride_col_dst, 1, stream_ptr,
+            ),
+            GgmlDType::Q6K => candle_kernels::ffi::launch_mmvq_gguf_q6_k_f32_plain(
+                weight_ptr, q8_1_ptr, dst_ptr, ncols as i32, nrows as i32,
+                stride_col_y, stride_col_dst, 1, stream_ptr,
+            ),
+            GgmlDType::Q8_0 => candle_kernels::ffi::launch_mmvq_gguf_q8_0_f32_plain(
+                weight_ptr, q8_1_ptr, dst_ptr, ncols as i32, nrows as i32,
+                stride_col_y, stride_col_dst, 1, stream_ptr,
+            ),
+            other => crate::bail!(
+                "mvq_plain_any_via_shared_q8_1: unsupported dtype {:?}", other
+            ),
+        }
+    }
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }

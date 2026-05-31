@@ -18,11 +18,10 @@ impl From<cudarc::cudnn::CudnnError> for crate::Error {
     }
 }
 
-impl From<cudarc::driver::DriverError> for crate::Error {
-    fn from(err: cudarc::driver::DriverError) -> Self {
-        crate::Error::wrap(err)
-    }
-}
+// `From<cudarc::driver::DriverError> for crate::Error` lives in
+// `cuda_backend/error.rs` so it's compiled with the cuda feature
+// alone (no cudnn dep needed). The old definition here is gone to
+// avoid a duplicate trait impl when both features are enabled.
 
 pub(crate) fn launch_conv2d<
     T: DeviceRepr + WithDType + ValidAsZeroBits + cudarc::cudnn::CudnnDataType,
@@ -95,7 +94,9 @@ pub(crate) fn launch_conv2d<
         y: &y,
     };
     let alg = match params.cudnn_fwd_algo {
-        None => conv2d.pick_algorithm()?,
+        // Default to IMPLICIT_PRECOMP_GEMM — much faster than pick_algorithm() which
+        // benchmarks all algorithms on every call (no caching in candle's cuDNN wrapper)
+        None => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
         Some(CandleAlgo::ImplicitGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
         Some(CandleAlgo::ImplicitPrecompGemm) => {
             A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM

@@ -1011,9 +1011,377 @@ test_device!(
     quantize_q8k_metal
 );
 
+fn quantize_q8_0(device: &Device) -> Result<()> {
+    let dtype = GgmlDType::Q8_0;
+    let src = get_test_vector2(0.5, 1024, device)?;
+    let quant = quantized::QTensor::quantize(&src, dtype)?;
+    let dst = quant.dequantize(device)?;
+    let src_v = src.to_vec1::<f32>()?;
+    let dst_v = dst.to_vec1::<f32>()?;
+    compare_with_error(dst_v.as_slice(), src_v.as_slice(), 0.008);
+
+    // Cross-check: quantizing the same tensor on CPU vs on the target device
+    // must dequantize to identical values (modulo f16 scale precision, which
+    // the arithmetic on both sides is constructed to match).
+    let src_cpu = get_test_vector2(0.5, 1024, &Device::Cpu)?;
+    let quant_cpu = quantized::QTensor::quantize(&src_cpu, dtype)?;
+    let dst_cpu = quant_cpu.dequantize(&Device::Cpu)?.to_vec1::<f32>()?;
+    for (i, (a, b)) in dst_v.iter().zip(dst_cpu.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-6,
+            "CPU/device Q8_0 divergence at index {i}: device={a}, cpu={b}"
+        );
+    }
+
+    let src_big = get_test_vector2(128.0, 1024, device)?;
+    let quant_big = quantized::QTensor::quantize(&src_big, dtype)?;
+    let dst_big = quant_big.dequantize(device)?.to_vec1::<f32>()?;
+    let src_big = src_big.to_vec1::<f32>()?;
+    compare_with_error(dst_big.as_slice(), src_big.as_slice(), 2.0);
+
+    ggml_quantization_error_test(dtype, device, GGML_MAX_QUANTIZATION_TOTAL_ERROR)?;
+    Ok(())
+}
+
+test_device!(
+    quantize_q8_0,
+    quantize_q8_0_cpu,
+    quantize_q8_0_cuda,
+    quantize_q8_0_metal
+);
+
+#[cfg(feature = "cuda")]
+#[test]
+fn attn_score_q8_0_q8_1_cuda() -> Result<()> {
+    use candle_core::quantized::{cuda::attn_score_q8_0_q8_1, QStorage};
+
+    let dev = Device::new_cuda(0)?;
+
+    for &head_dim in &[64usize, 128, 256] {
+        for &n_q_heads in &[1usize, 4, 8] {
+            for &seq_kv in &[512usize, 2048, 8192] {
+                let k_f32 = Tensor::randn(0.0_f32, 1.0, (seq_kv, head_dim), &dev)?;
+                let q_f32 = Tensor::randn(0.0_f32, 1.0, (n_q_heads, head_dim), &dev)?;
+
+                // Quantize K persistently to Q8_0 via the GPU-native path.
+                let k_q8 = quantized::QTensor::quantize(&k_f32, GgmlDType::Q8_0)?;
+                let k_storage_ref = match k_q8.storage() {
+                    QStorage::Cuda(c) => c,
+                    _ => unreachable!(),
+                };
+
+                // Q as a contiguous CudaView<f32>.
+                let (q_storage_guard, _) = q_f32.storage_and_layout();
+                let q_view = match &*q_storage_guard {
+                    candle_core::Storage::Cuda(c) => c
+                        .as_cuda_slice::<f32>()?
+                        .slice(0..n_q_heads * head_dim),
+                    _ => unreachable!(),
+                };
+
+                // Run the kernel.
+                let out_cuda = attn_score_q8_0_q8_1(
+                    k_storage_ref,
+                    &q_view,
+                    head_dim,
+                    seq_kv,
+                    n_q_heads,
+                )?;
+                let storage = candle_core::Storage::Cuda(out_cuda);
+                let layout = candle_core::Layout::contiguous((n_q_heads, seq_kv));
+                let out_vec = match &storage {
+                    candle_core::Storage::Cuda(c) => {
+                        let slice = c.as_cuda_slice::<f32>()?;
+                        let mut v = vec![0f32; n_q_heads * seq_kv];
+                        dev.as_cuda_device()?.memcpy_dtoh(slice, &mut v)?;
+                        v
+                    }
+                    _ => unreachable!(),
+                };
+                let _ = layout;
+
+                // Reference: F32 Q @ K^T on CPU (independent of our path).
+                let k_cpu = k_f32.to_device(&Device::Cpu)?;
+                let q_cpu = q_f32.to_device(&Device::Cpu)?;
+                let reference = q_cpu
+                    .matmul(&k_cpu.t()?.contiguous()?)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+
+                // Relative error vs F32 reference.
+                let mut abs_err_sum = 0.0f32;
+                let mut scale_sum = 0.0f32;
+                for (a, b) in out_vec.iter().zip(reference.iter()) {
+                    abs_err_sum += (a - b).abs();
+                    scale_sum += b.abs();
+                }
+                let rel_err = abs_err_sum / scale_sum.max(1e-6);
+
+                assert!(
+                    rel_err < 0.02,
+                    "head_dim={head_dim} n_q={n_q_heads} seq={seq_kv}: \
+                     rel_err {rel_err:.4} exceeds 2% (Q8_0 expected tolerance)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Very simple dot product implementation
 fn vec_dot_reference(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()
+}
+
+/// Q8_0 K-path attention score, device-position variant. Verifies that the
+/// dev_pos kernel produces scores numerically equivalent to the existing
+/// non-dev_pos `attn_score_q8_0_q8_1_gqa` for valid positions (within Q8
+/// quantisation tolerance), and writes -INFINITY for positions ≥ seq_kv.
+#[cfg(feature = "cuda")]
+#[test]
+fn attn_score_q8_0_f32_dev_pos_cuda() -> Result<()> {
+    use candle_core::quantized::cuda::{
+        attn_score_q8_0_f32_dev_pos, attn_score_q8_0_q8_1_gqa,
+    };
+    use candle_core::quantized::{QStorage, QTensor};
+
+    let dev = Device::new_cuda(0)?;
+    let cuda_dev = dev.as_cuda_device()?;
+
+    for &head_dim in &[64usize, 128, 256] {
+        for &(n_kv_heads, n_q_per_kv) in
+            &[(1usize, 1usize), (2, 4), (4, 8), (8, 5)]
+        {
+            let n_q_heads = n_kv_heads * n_q_per_kv;
+            for &seq_kv in &[37usize, 256, 1023] {
+                // K_full as a flat F32 [seq, n_kv, head_dim] tensor — matches
+                // the Q8KvCache layout. Quantise once to Q8_0 and re-use the
+                // packed blob for both the non-dev_pos baseline and our
+                // dev_pos kernel.
+                let k_f32 = Tensor::randn(
+                    0.0f32, 1.0, (seq_kv, n_kv_heads, head_dim), &dev,
+                )?;
+                let k_flat = k_f32.flatten_all()?;
+                let k_q = QTensor::quantize(&k_flat, GgmlDType::Q8_0)?;
+                let k_blob = match k_q.storage() {
+                    QStorage::Cuda(c) => c.cuda_slice(),
+                    _ => unreachable!(),
+                };
+
+                // Q as a contiguous CudaView<f32>.
+                let q_f32 = Tensor::randn(
+                    0.0f32, 1.0, (n_q_heads, head_dim), &dev,
+                )?;
+                let (q_storage_guard, _) = q_f32.storage_and_layout();
+                let q_view = match &*q_storage_guard {
+                    candle_core::Storage::Cuda(c) => c
+                        .as_cuda_slice::<f32>()?
+                        .slice(0..n_q_heads * head_dim),
+                    _ => unreachable!(),
+                };
+
+                // Baseline: existing non-dev_pos GQA kernel. Returns
+                // f32 [n_q_heads, seq_kv].
+                let baseline = attn_score_q8_0_q8_1_gqa(
+                    k_blob, &q_view, head_dim, seq_kv,
+                    n_kv_heads, n_q_per_kv, cuda_dev,
+                )?;
+                let baseline_v = {
+                    let storage = candle_core::Storage::Cuda(baseline);
+                    match &storage {
+                        candle_core::Storage::Cuda(c) => {
+                            let s = c.as_cuda_slice::<f32>()?;
+                            let mut v = vec![0f32; n_q_heads * seq_kv];
+                            cuda_dev.memcpy_dtoh(s, &mut v)?;
+                            v
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+
+                // Dev_pos kernel: seq_kv_dev = current_seq_len BEFORE append
+                // = seq_kv - 1 (kernel adds 1 internally to derive seq_kv).
+                // max_seq_padded chosen as the next multiple of 32 above
+                // seq_kv + some slack to exercise the -INF masking path.
+                let max_seq_padded = ((seq_kv + 64) + 31) & !31;
+                let pos_before_append: i32 = (seq_kv as i32) - 1;
+                let mut seq_kv_dev = cuda_dev.alloc_zeros::<i32>(1)?;
+                cuda_dev.memcpy_htod(&[pos_before_append], &mut seq_kv_dev)?;
+
+                let devpos = attn_score_q8_0_f32_dev_pos(
+                    k_blob, &q_view, &seq_kv_dev,
+                    head_dim, max_seq_padded,
+                    n_kv_heads, n_q_per_kv, cuda_dev,
+                )?;
+                let devpos_v = {
+                    let storage = candle_core::Storage::Cuda(devpos);
+                    match &storage {
+                        candle_core::Storage::Cuda(c) => {
+                            let s = c.as_cuda_slice::<f32>()?;
+                            let mut v = vec![0f32; n_q_heads * max_seq_padded];
+                            cuda_dev.memcpy_dtoh(s, &mut v)?;
+                            v
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+
+                // Valid range [0, seq_kv): scores must match baseline within
+                // float-comparison noise. Both kernels dequantise the SAME
+                // Q8 blob so the only delta is the warp-reduction order —
+                // negligible at HD ≤ 256.
+                let mut max_abs = 0.0f32;
+                for h in 0..n_q_heads {
+                    for s in 0..seq_kv {
+                        let b = baseline_v[h * seq_kv + s];
+                        let d = devpos_v[h * max_seq_padded + s];
+                        max_abs = max_abs.max((b - d).abs());
+                    }
+                }
+                let tolerance = 1e-2;
+                assert!(
+                    max_abs < tolerance,
+                    "head_dim={head_dim} n_kv={n_kv_heads} n_q_per_kv={n_q_per_kv} \
+                     seq_kv={seq_kv}: max_abs {max_abs:.4e} exceeds {tolerance}"
+                );
+
+                // Padding range [seq_kv, max_seq_padded): -INFINITY.
+                for h in 0..n_q_heads {
+                    for s in seq_kv..max_seq_padded {
+                        let v = devpos_v[h * max_seq_padded + s];
+                        assert!(
+                            v == f32::NEG_INFINITY,
+                            "head_dim={head_dim} seq_kv={seq_kv} h={h} s={s}: \
+                             expected -INFINITY, got {v}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Q8_0 V-path attention output, device-position variant. Verifies the
+/// dev_pos output matches the non-dev_pos baseline when probs at positions
+/// ≥ seq_kv are zero (as the dev_pos softmax produces them).
+#[cfg(feature = "cuda")]
+#[test]
+fn attn_output_q8_0_f32_dev_pos_cuda() -> Result<()> {
+    use candle_core::quantized::cuda::{
+        attn_output_q8_0_f32_dev_pos, attn_output_q8_0_f32_gqa,
+    };
+    use candle_core::quantized::{QStorage, QTensor};
+
+    let dev = Device::new_cuda(0)?;
+    let cuda_dev = dev.as_cuda_device()?;
+
+    for &head_dim in &[64usize, 128, 256] {
+        for &(n_kv_heads, n_q_per_kv) in
+            &[(1usize, 1usize), (2, 4), (4, 8), (8, 5)]
+        {
+            let n_q_heads = n_kv_heads * n_q_per_kv;
+            for &seq_kv in &[37usize, 256, 1023] {
+                // V as Q8_0 [seq, n_kv, head_dim].
+                let v_f32 = Tensor::randn(
+                    0.0f32, 1.0, (seq_kv, n_kv_heads, head_dim), &dev,
+                )?;
+                let v_flat = v_f32.flatten_all()?;
+                let v_q = QTensor::quantize(&v_flat, GgmlDType::Q8_0)?;
+                let v_blob = match v_q.storage() {
+                    QStorage::Cuda(c) => c.cuda_slice(),
+                    _ => unreachable!(),
+                };
+
+                // Probs at the seq_kv stride for the baseline.
+                let probs_seqkv = Tensor::rand(
+                    0.0f32, 1.0, (n_q_heads, seq_kv), &dev,
+                )?;
+                let probs_seqkv_v = probs_seqkv
+                    .flatten_all()?.to_vec1::<f32>()?;
+                let (probs_storage_guard, _) =
+                    probs_seqkv.storage_and_layout();
+                let probs_view = match &*probs_storage_guard {
+                    candle_core::Storage::Cuda(c) => c
+                        .as_cuda_slice::<f32>()?
+                        .slice(0..n_q_heads * seq_kv),
+                    _ => unreachable!(),
+                };
+
+                let baseline = attn_output_q8_0_f32_gqa(
+                    v_blob, &probs_view, head_dim, seq_kv,
+                    n_kv_heads, n_q_per_kv, cuda_dev,
+                )?;
+                let baseline_v = {
+                    let storage = candle_core::Storage::Cuda(baseline);
+                    match &storage {
+                        candle_core::Storage::Cuda(c) => {
+                            let s = c.as_cuda_slice::<f32>()?;
+                            let mut v = vec![0f32; n_q_heads * head_dim];
+                            cuda_dev.memcpy_dtoh(s, &mut v)?;
+                            v
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+
+                // Dev_pos: probs at max_seq_padded stride, padded with 0.
+                let max_seq_padded = ((seq_kv + 64) + 31) & !31;
+                let mut probs_padded =
+                    vec![0.0f32; n_q_heads * max_seq_padded];
+                for h in 0..n_q_heads {
+                    for s in 0..seq_kv {
+                        probs_padded[h * max_seq_padded + s] =
+                            probs_seqkv_v[h * seq_kv + s];
+                    }
+                }
+                let probs_padded_t = Tensor::from_slice(
+                    &probs_padded, (n_q_heads, max_seq_padded), &dev,
+                )?;
+                let (pp_guard, _) = probs_padded_t.storage_and_layout();
+                let probs_padded_view = match &*pp_guard {
+                    candle_core::Storage::Cuda(c) => c
+                        .as_cuda_slice::<f32>()?
+                        .slice(0..n_q_heads * max_seq_padded),
+                    _ => unreachable!(),
+                };
+
+                let pos_before_append: i32 = (seq_kv as i32) - 1;
+                let mut seq_kv_dev = cuda_dev.alloc_zeros::<i32>(1)?;
+                cuda_dev.memcpy_htod(&[pos_before_append], &mut seq_kv_dev)?;
+
+                let devpos = attn_output_q8_0_f32_dev_pos(
+                    v_blob, &probs_padded_view, &seq_kv_dev,
+                    head_dim, max_seq_padded,
+                    n_kv_heads, n_q_per_kv, cuda_dev,
+                )?;
+                let devpos_v = {
+                    let storage = candle_core::Storage::Cuda(devpos);
+                    match &storage {
+                        candle_core::Storage::Cuda(c) => {
+                            let s = c.as_cuda_slice::<f32>()?;
+                            let mut v = vec![0f32; n_q_heads * head_dim];
+                            cuda_dev.memcpy_dtoh(s, &mut v)?;
+                            v
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+
+                let mut max_abs = 0.0f32;
+                for (b, d) in baseline_v.iter().zip(devpos_v.iter()) {
+                    max_abs = max_abs.max((b - d).abs());
+                }
+                let tolerance = 1e-3;
+                assert!(
+                    max_abs < tolerance,
+                    "head_dim={head_dim} n_kv={n_kv_heads} n_q_per_kv={n_q_per_kv} \
+                     seq_kv={seq_kv}: max_abs {max_abs:.4e} exceeds {tolerance}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns the error achieved by the GGML matmul unit test.

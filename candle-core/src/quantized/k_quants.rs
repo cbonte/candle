@@ -19,6 +19,25 @@ pub const QK5_0: usize = 32;
 pub const QK5_1: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
+pub const QK_MXFP4: usize = 32;
+
+/// OCP MXFP4 E2M1 code → value LUT (ggml `kvalues_mxfp4`). These are the
+/// representable magnitudes ×2 (the ×0.5 is folded into the E8M0 scale via
+/// `e8m0_to_fp32_half`), so dequant = `KVALUES_MXFP4[code] * e8m0_to_fp32_half(e)`.
+pub(crate) const KVALUES_MXFP4: [i8; 16] =
+    [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// ggml `ggml_e8m0_to_fp32_half`: 0.5 · 2^(e−127), matching the KVALUES_MXFP4
+/// (×2) convention. Denormal patterns for e<2, normalized exponent otherwise.
+#[inline]
+pub(crate) fn e8m0_to_fp32_half(e: u8) -> f32 {
+    let bits: u32 = if e < 2 {
+        0x0020_0000u32 << e
+    } else {
+        (e as u32 - 1) << 23
+    };
+    f32::from_bits(bits)
+}
 
 pub trait GgmlType: Sized + Clone + Send + Sync {
     const DTYPE: GgmlDType;
@@ -2484,6 +2503,103 @@ impl GgmlType for bf16 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockMxFp4 {
+    pub(crate) e: u8,                  // E8M0 per-block scale
+    pub(crate) qs: [u8; QK_MXFP4 / 2], // 32 × 4-bit E2M1 codes, packed
+}
+const _: () = assert!(std::mem::size_of::<BlockMxFp4>() == 17);
+
+impl GgmlType for BlockMxFp4 {
+    const DTYPE: GgmlDType = GgmlDType::MxFp4;
+    const BLCK_SIZE: usize = QK_MXFP4;
+    type VecDotType = BlockQ8_0;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(k.is_multiple_of(QK_MXFP4));
+        let nb = k / QK_MXFP4;
+        for i in 0..nb {
+            let d = e8m0_to_fp32_half(xs[i].e);
+            // Interleaved like Q4_0: low nibbles → first half, high → second.
+            for j in 0..QK_MXFP4 / 2 {
+                let b = xs[i].qs[j];
+                ys[i * QK_MXFP4 + j] = KVALUES_MXFP4[(b & 0x0F) as usize] as f32 * d;
+                ys[i * QK_MXFP4 + j + QK_MXFP4 / 2] =
+                    KVALUES_MXFP4[(b >> 4) as usize] as f32 * d;
+            }
+        }
+    }
+
+    fn from_float(xs: &[f32], ys: &mut [Self]) {
+        let k = xs.len();
+        debug_assert!(k.is_multiple_of(QK_MXFP4));
+        let nb = k / QK_MXFP4;
+        for i in 0..nb {
+            let xb = &xs[i * QK_MXFP4..(i + 1) * QK_MXFP4];
+            let amax = xb.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            // Max real magnitude is 6.0; choose e so amax ≈ 6·2^(e-127).
+            let e: u8 = if amax > 0.0 {
+                let ratio = (amax / 6.0).max(f32::MIN_POSITIVE);
+                ((ratio.log2().round() as i32) + 127).clamp(0, 255) as u8
+            } else {
+                0
+            };
+            let d = e8m0_to_fp32_half(e);
+            let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
+            let mut qs = [0u8; QK_MXFP4 / 2];
+            for j in 0..QK_MXFP4 / 2 {
+                let lo = quantize_mxfp4_nibble(xb[j] * inv);
+                let hi = quantize_mxfp4_nibble(xb[j + QK_MXFP4 / 2] * inv);
+                qs[j] = lo | (hi << 4);
+            }
+            ys[i].e = e;
+            ys[i].qs = qs;
+        }
+    }
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        // Dequant-then-dot: MXFP4 weight block × Q8_0 activation block. MXFP4
+        // is interleaved (logical j / j+16); Q8_0 qs is sequential, so logical
+        // index j maps to ys.qs[j].
+        debug_assert!(n.is_multiple_of(QK_MXFP4));
+        let nb = n / QK_MXFP4;
+        let mut sum = 0f32;
+        for i in 0..nb {
+            let d = e8m0_to_fp32_half(xs[i].e);
+            let yd = ys[i].d.to_f32();
+            for j in 0..QK_MXFP4 / 2 {
+                let b = xs[i].qs[j];
+                let w0 = KVALUES_MXFP4[(b & 0x0F) as usize] as f32 * d;
+                let w1 = KVALUES_MXFP4[(b >> 4) as usize] as f32 * d;
+                sum += w0 * (ys[i].qs[j] as f32 * yd);
+                sum += w1 * (ys[i].qs[j + QK_MXFP4 / 2] as f32 * yd);
+            }
+        }
+        sum
+    }
+}
+
+/// Nearest MXFP4 4-bit code for a value already divided by the block scale.
+#[inline]
+fn quantize_mxfp4_nibble(x: f32) -> u8 {
+    let mut best = 0usize;
+    let mut best_err = f32::INFINITY;
+    for (i, &kv) in KVALUES_MXFP4.iter().enumerate() {
+        let err = (kv as f32 - x).abs();
+        if err < best_err {
+            best_err = err;
+            best = i;
+        }
+    }
+    best as u8
+}
+
 macro_rules! verify_block_size {
     ( $block_type:ident ) => {
         const _: () =
@@ -2501,5 +2617,5 @@ macro_rules! verify_block_sizes {
 
 verify_block_sizes!(
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1, BlockQ2K, BlockQ3K, BlockQ4K,
-    BlockQ5K, BlockQ6K, BlockQ8K, f32, f16, bf16
+    BlockQ5K, BlockQ6K, BlockQ8K, BlockMxFp4, f32, f16, bf16
 );

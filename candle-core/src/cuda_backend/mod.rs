@@ -7,7 +7,7 @@ pub use candle_kernels as kernels;
 pub use cudarc;
 use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{
-    CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
+    CudaSlice, DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
 use half::{bf16, f16};
 
@@ -16,7 +16,7 @@ pub mod cudnn;
 mod device;
 mod error;
 mod utils;
-pub use device::{CudaDevice, DeviceId};
+pub use device::{clear_device_cache, CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
@@ -1259,6 +1259,16 @@ impl CudaStorage {
     }
 
     pub fn transfer_to_device(&self, dst: &CudaDevice) -> Result<Self> {
+        // Cross-GPU path: explicit `cuMemcpyPeerAsync` on the destination
+        // stream. We can't rely on cudarc's `clone_dtod`/`memcpy_dtod` —
+        // on this fork's build it silently produced garbage across contexts
+        // (verified empirically on a 2-GPU RTX 5070 Ti + 5060 Ti rig with
+        // qwen3-coder). Calling the peer copy directly — with the src context
+        // bound around the copy and a stream sync afterwards — works, and is
+        // still a single peer-to-peer transfer rather than a host round-trip.
+        if !self.device.same_device(dst) {
+            return self.transfer_to_device_peer(dst);
+        }
         let dst_stream = dst.cuda_stream();
         let storage_slice = match self.dtype() {
             DType::U8 => {
@@ -1332,6 +1342,129 @@ impl CudaStorage {
                 CudaStorageSlice::F8E8M0(result)
             }
         };
+
+        Ok(Self {
+            slice: storage_slice,
+            device: dst.clone(),
+        })
+    }
+
+    /// Peer-to-peer cross-GPU transfer via `cuMemcpyPeerAsync`.
+    ///
+    /// Called by `transfer_to_device` when src/dst are different physical
+    /// GPUs. Allocates a destination slice on `dst`, then issues a single
+    /// peer-context memcpy (async on `dst`'s stream) and syncs that stream
+    /// so the returned storage is ready for use on `dst`.
+    fn transfer_to_device_peer(&self, dst: &CudaDevice) -> Result<Self> {
+        use cudarc::driver::{result as drv_result, sys};
+
+        let dst_stream = dst.cuda_stream();
+        let src_stream = self.device.cuda_stream();
+        let src_ctx = src_stream.context().cu_ctx();
+        let dst_ctx = dst_stream.context().cu_ctx();
+        let stream_handle = dst_stream.cu_stream();
+
+        // Element count is dtype-dependent; extract it from each variant
+        // and allocate the matching typed slice on `dst`. We then grab
+        // the raw device pointer, fire `cuMemcpyPeerAsync`, and sync.
+        //
+        // IMPORTANT: dtod/peer copies don't implicitly wait on whatever
+        // produced `self`. Use an event to make dst_stream wait for
+        // src_stream's pending work without a host sync.
+        // Non-default streams (per-thread or new_stream) must have the
+        // matching context bound BEFORE the op, otherwise the stream
+        // handle resolves to the wrong physical stream and cross-thread
+        // submissions race → garbled outputs. Mirrors llama.cpp's
+        // `ggml_cuda_set_device` discipline.
+        let need_explicit_bind = !src_stream.cu_stream().is_null()
+            || !dst_stream.cu_stream().is_null();
+
+        {
+            use cudarc::driver::sys;
+            let mut evt: sys::CUevent = std::ptr::null_mut();
+            if need_explicit_bind { src_stream.context().bind_to_thread().w()?; }
+            unsafe {
+                sys::cuEventCreate(&mut evt, 0).result().w()?;
+                sys::cuEventRecord(evt, src_stream.cu_stream()).result().w()?;
+            }
+            if need_explicit_bind { dst_stream.context().bind_to_thread().w()?; }
+            unsafe {
+                sys::cuStreamWaitEvent(dst_stream.cu_stream(), evt, 0).result().w()?;
+            }
+            if need_explicit_bind { src_stream.context().bind_to_thread().w()?; }
+            unsafe {
+                sys::cuEventDestroy_v2(evt).result().w()?;
+            }
+        }
+        // Bind the destination context for the alloc + copy. cudarc
+        // allocations are context-sensitive; without an explicit bind,
+        // an alloc following ops on a different device can land in the
+        // wrong context.
+        dst_stream.context().bind_to_thread().w()?;
+
+        fn peer_copy<T: cudarc::driver::DeviceRepr>(
+            src_slice: &CudaSlice<T>,
+            dst: &CudaDevice,
+            src_ctx: sys::CUcontext,
+            dst_ctx: sys::CUcontext,
+            stream_handle: sys::CUstream,
+        ) -> Result<CudaSlice<T>> {
+            let len = src_slice.len();
+            // SAFETY: dst stream is already bound; alloc returns a valid
+            // CudaSlice on dst. We overwrite every byte via the peer copy
+            // below before any read, so uninitialised memory is fine.
+            let mut dst_slice = unsafe { dst.alloc::<T>(len)? };
+            let num_bytes = len * std::mem::size_of::<T>();
+            // Raw pointers — cudarc's safe API goes through a sync-tracking
+            // path that we bypass intentionally (we manage sync by hand via
+            // src_stream.synchronize above + dst_stream.synchronize below).
+            let dst_stream = dst.cuda_stream();
+            let (src_ptr, _src_guard) = src_slice.device_ptr(&dst_stream);
+            let (dst_ptr, _dst_guard) = dst_slice.device_ptr_mut(&dst_stream);
+            unsafe {
+                drv_result::memcpy_peer_async(
+                    dst_ctx, dst_ptr, src_ctx, src_ptr, num_bytes, stream_handle,
+                )
+            }.w()?;
+            drop(_src_guard);
+            drop(_dst_guard);
+            Ok(dst_slice)
+        }
+
+        let storage_slice = match self.dtype() {
+            DType::U8 => CudaStorageSlice::U8(peer_copy(
+                self.as_cuda_slice::<u8>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::U32 => CudaStorageSlice::U32(peer_copy(
+                self.as_cuda_slice::<u32>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::I16 => CudaStorageSlice::I16(peer_copy(
+                self.as_cuda_slice::<i16>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::I32 => CudaStorageSlice::I32(peer_copy(
+                self.as_cuda_slice::<i32>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::I64 => CudaStorageSlice::I64(peer_copy(
+                self.as_cuda_slice::<i64>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::BF16 => CudaStorageSlice::BF16(peer_copy(
+                self.as_cuda_slice::<bf16>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::F16 => CudaStorageSlice::F16(peer_copy(
+                self.as_cuda_slice::<f16>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::F32 => CudaStorageSlice::F32(peer_copy(
+                self.as_cuda_slice::<f32>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::F64 => CudaStorageSlice::F64(peer_copy(
+                self.as_cuda_slice::<f64>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::F8E4M3 => CudaStorageSlice::F8E4M3(peer_copy(
+                self.as_cuda_slice::<float8::F8E4M3>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::F6E2M3 => CudaStorageSlice::F6E2M3(peer_copy(
+                self.as_cuda_slice::<u8>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::F6E3M2 => CudaStorageSlice::F6E3M2(peer_copy(
+                self.as_cuda_slice::<u8>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::F4 => CudaStorageSlice::F4(peer_copy(
+                self.as_cuda_slice::<u8>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+            DType::F8E8M0 => CudaStorageSlice::F8E8M0(peer_copy(
+                self.as_cuda_slice::<u8>()?, dst, src_ctx, dst_ctx, stream_handle)?),
+        };
+
+        // Stream-ordered semantics: cuMemcpyPeerAsync was queued on
+        // dst_stream above. Any subsequent op on dst_stream waits for
+        // it automatically. No host sync needed.
 
         Ok(Self {
             slice: storage_slice,

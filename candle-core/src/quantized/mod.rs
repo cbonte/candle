@@ -105,6 +105,7 @@ impl QStorage {
                 GgmlDType::Q5K => metal::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                GgmlDType::MxFp4 => metal::load_quantized(d, as_t_slice::<BlockMxFp4>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
             },
             Device::Cuda(d) => match dtype {
@@ -122,6 +123,7 @@ impl QStorage {
                 GgmlDType::Q5K => cuda::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                GgmlDType::MxFp4 => cuda::load_quantized(d, as_t_slice::<BlockMxFp4>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
         }
@@ -289,6 +291,10 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    /// OCP Microscaling FP4 (E2M1 + per-32-block E8M0 scale). ggml type 39,
+    /// used by gpt-oss. Inference: dequant (to_float) + dequant-then-dot
+    /// vec_dot. See k_quants::BlockMxFp4.
+    MxFp4,
 }
 
 impl GgmlDType {
@@ -310,6 +316,7 @@ impl GgmlDType {
             15 => Self::Q8K,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
+            39 => Self::MxFp4,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -333,6 +340,7 @@ impl GgmlDType {
             Self::Q8K => 15,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
+            Self::MxFp4 => 39,
         }
     }
 
@@ -353,6 +361,9 @@ impl GgmlDType {
             Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
+            Self::MxFp4 => {
+                Box::new(vec![BlockMxFp4::zeros(); elem_count / BlockMxFp4::BLCK_SIZE])
+            }
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
         }
     }
@@ -373,6 +384,7 @@ impl GgmlDType {
             Self::Q5K => Box::new(as_t_slice::<BlockQ5K>(data).to_vec()),
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
+            Self::MxFp4 => Box::new(as_t_slice::<BlockMxFp4>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
         }
     }
@@ -396,6 +408,7 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::MxFp4 => std::mem::size_of::<BlockMxFp4>(),
         }
     }
 
@@ -411,6 +424,7 @@ impl GgmlDType {
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::MxFp4 => k_quants::QK_MXFP4,
         }
     }
 }
@@ -461,7 +475,24 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
 
     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
         let mut ys = vec![0.0f32; elem_count];
-        T::to_float(self.as_slice(), &mut ys);
+        let blocks = self.as_slice();
+        // `to_float` is per-block independent, so for large tensors we shard
+        // the blocks across cores (gpt-oss MXFP4 experts are ~265M elems each;
+        // a single-threaded dequant dominated model load). Output is
+        // bit-identical to the serial path (exact block-aligned chunking).
+        const PAR_ELEM_THRESHOLD: usize = 1 << 20;
+        if elem_count >= PAR_ELEM_THRESHOLD && T::BLCK_SIZE > 0 {
+            use rayon::prelude::*;
+            let blck = T::BLCK_SIZE;
+            let blocks_per_chunk = 4096usize;
+            ys.par_chunks_mut(blocks_per_chunk * blck)
+                .zip(blocks.par_chunks(blocks_per_chunk))
+                .for_each(|(y_chunk, b_chunk)| {
+                    T::to_float(b_chunk, y_chunk);
+                });
+        } else {
+            T::to_float(blocks, &mut ys);
+        }
         Ok(CpuStorage::F32(ys))
     }
 
@@ -668,6 +699,13 @@ impl QTensor {
 
     pub fn storage_size_in_bytes(&self) -> usize {
         self.storage.size_in_bytes()
+    }
+
+    /// Direct access to the backing storage. Needed by downstream crates that
+    /// call backend-specific quantized kernels (e.g., the attention-score
+    /// gemv) without round-tripping through `dequantize`.
+    pub fn storage(&self) -> &QStorage {
+        &self.storage
     }
 
     pub fn data(&self) -> Result<Cow<'_, [u8]>> {
