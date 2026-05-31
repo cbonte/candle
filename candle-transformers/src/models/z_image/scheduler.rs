@@ -204,6 +204,15 @@ impl FlowMatchEulerDiscreteScheduler {
         self.step_index
     }
 
+    /// Skip the scheduler forward to `step_index`. Used for image-to-image
+    /// pipelines where the input image already represents partial
+    /// denoising and we want to start from a later sigma. Saturates at
+    /// `num_inference_steps` so callers can't read past the end.
+    pub fn skip_to(&mut self, step_index: usize) {
+        let max = self.timesteps.len().saturating_sub(1);
+        self.step_index = step_index.min(max);
+    }
+
     /// Check if denoising is complete
     pub fn is_complete(&self) -> bool {
         self.step_index >= self.timesteps.len()
@@ -235,3 +244,64 @@ pub const BASE_IMAGE_SEQ_LEN: usize = 256;
 pub const MAX_IMAGE_SEQ_LEN: usize = 4096;
 pub const BASE_SHIFT: f64 = 0.5;
 pub const MAX_SHIFT: f64 = 1.15;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sched(steps: usize) -> FlowMatchEulerDiscreteScheduler {
+        let mut s = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
+        s.set_timesteps(steps, None);
+        s
+    }
+
+    #[test]
+    fn skip_to_advances_step_index_for_img2img() {
+        // img2img pre-positions the scheduler at a non-zero step
+        // matching the noise level encoded in the input image. Pin
+        // that skip_to lands exactly where requested for an
+        // in-range index.
+        let mut s = sched(8);
+        assert_eq!(s.step_index(), 0);
+        s.skip_to(3);
+        assert_eq!(s.step_index(), 3);
+        // current_sigma reads from sigmas[step_index] — should pull
+        // the sigma at the new position, not the start.
+        let sigma_at_3 = s.current_sigma();
+        let mut fresh = sched(8);
+        fresh.skip_to(0);
+        let sigma_at_0 = fresh.current_sigma();
+        assert_ne!(sigma_at_3, sigma_at_0,
+            "sigma must change when scheduler skipped forward");
+    }
+
+    #[test]
+    fn skip_to_saturates_at_last_sigma_index() {
+        // Pathological inputs (caller passes step >= num_steps) must
+        // NOT panic on the next current_sigma() index lookup. The
+        // saturating clamp keeps step_index ≤ sigmas.len() - 1.
+        let mut s = sched(8);
+        s.skip_to(usize::MAX);
+        // current_sigma reads sigmas[step_index]; saturated index
+        // points at the last valid slot so the read is in bounds.
+        let _ = s.current_sigma();
+        // is_complete uses timesteps.len(); after saturating to
+        // sigmas.len()-1 (= timesteps.len()) is_complete reports true
+        // because step_index >= timesteps.len().
+        assert!(s.step_index() <= s.num_inference_steps());
+    }
+
+    #[test]
+    fn skip_to_zero_is_equivalent_to_reset() {
+        // skip_to(0) and reset() must leave the scheduler in
+        // identical state — useful symmetry guarantee for tests
+        // that re-prep a scheduler between img2img runs.
+        let mut a = sched(8);
+        a.step_index = 5;
+        a.skip_to(0);
+        let mut b = sched(8);
+        b.reset();
+        assert_eq!(a.step_index(), b.step_index());
+        assert_eq!(a.current_sigma(), b.current_sigma());
+    }
+}

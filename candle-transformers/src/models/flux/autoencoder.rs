@@ -1,4 +1,4 @@
-use candle::{Result, Tensor, D};
+use candle::{DType, Result, Tensor, D};
 use candle_nn::{conv2d, group_norm, Conv2d, GroupNorm, VarBuilder};
 
 // https://github.com/black-forest-labs/flux/blob/727e3a71faf37390f318cf9434f0939653302b60/src/flux/modules/autoencoder.py#L9
@@ -50,8 +50,41 @@ impl Config {
 fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (dim as f64).sqrt();
-    let attn_weights = (q.matmul(&k.t()?)? * scale_factor)?;
-    candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(v)
+
+    // Flash attention for VAE's 4096-position spatial attention.
+    // Gated to head_dim <= 256: candle-flash-attn returns NaN at HD=512
+    // (the Flux VAE mid block uses HD=mid_channels=512). Naive path is
+    // numerically correct.
+    #[cfg(feature = "flash-attn")]
+    if q.device().is_cuda() && dim <= 256 {
+        let orig_dtype = q.dtype();
+        let fa_dtype = if orig_dtype == DType::BF16 || orig_dtype == DType::F16 {
+            orig_dtype
+        } else {
+            DType::BF16
+        };
+        // q,k,v: (batch, 1, seq, dim) → flash needs (batch, seq, heads, dim)
+        let q_fa = q.to_dtype(fa_dtype)?.transpose(1, 2)?.contiguous()?;
+        let k_fa = k.to_dtype(fa_dtype)?.transpose(1, 2)?.contiguous()?;
+        let v_fa = v.to_dtype(fa_dtype)?.transpose(1, 2)?.contiguous()?;
+        let out = candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale_factor as f32, false)?;
+        return out.transpose(1, 2)?.to_dtype(orig_dtype);
+    }
+
+    // F16 attention overflows: with seq=4096, dim=512 (VAE mid block), q@k.t
+    // produces values up to O(seq) which exceeds F16 max (65504). Promote to
+    // F32 for the matmul + softmax, then cast back. BF16 has F32 exponent
+    // range so no promotion needed.
+    let orig_dtype = q.dtype();
+    let needs_promote = orig_dtype == DType::F16;
+    let (q_, k_, v_) = if needs_promote {
+        (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?, v.to_dtype(DType::F32)?)
+    } else {
+        (q.clone(), k.clone(), v.clone())
+    };
+    let attn_weights = (q_.matmul(&k_.t()?)? * scale_factor)?;
+    let out = candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v_)?;
+    if needs_promote { out.to_dtype(orig_dtype) } else { Ok(out) }
 }
 
 #[derive(Debug, Clone)]
