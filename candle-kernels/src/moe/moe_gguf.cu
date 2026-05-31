@@ -27,6 +27,546 @@ constexpr int ceil_div(int a, int b) {
     return (a + b - 1) / b;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Building block: device-side expert offsets.
+//
+// Given `sorted_expert_ids` (length M, sorted ascending so all pairs for
+// expert E are contiguous), emits `expert_offsets[num_experts + 1]` where
+// expert_offsets[e]   = index of first pair with expert_id == e
+// expert_offsets[e+1] = index of first pair with expert_id > e
+// (so expert_counts[e] = expert_offsets[e+1] - expert_offsets[e]).
+//
+// One block per expert slot; each block does an O(log M) lower-bound
+// binary search to find its starting index. Block `num_experts` writes
+// the sentinel M. Used by the per-expert dispatch alternative to the
+// `moe_gemm_gguf_*` kernels for prefill batches where the current
+// per-(token,expert) kernel emits an O(num_tokens × topk) grid.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void moe_expert_offsets_kernel(
+    const int32_t* __restrict__ sorted_expert_ids,
+    int32_t* __restrict__ expert_offsets,
+    const int M,
+    const int num_experts
+) {
+    const int e = blockIdx.x;
+    if (e > num_experts) return;
+    if (threadIdx.x != 0) return;
+
+    if (e == num_experts) {
+        expert_offsets[num_experts] = M;
+        return;
+    }
+
+    // Lower bound: first i with sorted_expert_ids[i] >= e.
+    int lo = 0, hi = M;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (sorted_expert_ids[mid] < e) lo = mid + 1;
+        else hi = mid;
+    }
+    expert_offsets[e] = lo;
+}
+
+extern "C" void moe_expert_offsets(
+    const int32_t* sorted_expert_ids,
+    int32_t* expert_offsets,
+    int M,
+    int num_experts,
+    cudaStream_t stream
+) {
+    dim3 grid(num_experts + 1, 1, 1);
+    dim3 block(1, 1, 1);
+    moe_expert_offsets_kernel<<<grid, block, 0, stream>>>(
+        sorted_expert_ids, expert_offsets, M, num_experts
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Step 3: input gather for per-expert dispatch.
+//
+// Given a sub-range `sorted_token_ids[start..end]` of pair indices (each
+// `pair_idx = real_token_idx × topk + k`), produces a contiguous F16
+// buffer `[N_e, K]` whose row `i` is `inputs[sorted_token_ids[start+i] / topk]`.
+//
+// One block per output row, one thread per K element (with strided loop
+// for K > block_dim). Output is contiguous, ready for cuBLAS GEMM with
+// the dequantized expert weights.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void moe_gather_input_rows_f32_to_f16_kernel(
+    const float* __restrict__ inputs,           // [num_real_tokens, K]
+    const int32_t* __restrict__ sorted_token_ids, // [size_m]
+    __half* __restrict__ out,                   // [n_e, K]
+    const int start,
+    const int K,
+    const int topk
+) {
+    const int row = blockIdx.x;
+    const int pair_idx = sorted_token_ids[start + row];
+    const int real_token = pair_idx / topk;
+    const float* __restrict__ src = inputs + (size_t)real_token * K;
+    __half*       __restrict__ dst = out    + (size_t)row        * K;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        dst[i] = __float2half(src[i]);
+    }
+}
+
+extern "C" void moe_gather_input_rows_f32_to_f16(
+    const float* inputs,
+    const int32_t* sorted_token_ids,
+    void* out_f16,
+    int n_e,
+    int start,
+    int K,
+    int topk,
+    cudaStream_t stream
+) {
+    if (n_e <= 0) return;
+    const int block = (K < 256) ? K : 256;
+    dim3 grid(n_e, 1, 1);
+    dim3 blk(block, 1, 1);
+    moe_gather_input_rows_f32_to_f16_kernel<<<grid, blk, 0, stream>>>(
+        inputs, sorted_token_ids, (__half*)out_f16, start, K, topk
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Step 3: GELU(gate) * up + scatter to final output.
+//
+// Per-expert post-GEMM step. Input is `[n_e, 2N]` F16 from the cuBLAS
+// GEMM (concatenated gate||up). For each row i in [0, n_e):
+//   gate_act = gelu_tanh(in[i, 0..N])
+//   out[sorted_token_ids[start+i], n] = gate_act[n] * in[i, N+n]
+// where `out` is the final `[size_m, N]` F32 buffer.
+// Atomic not needed — sorted_token_ids[start..start+n_e] are unique within
+// an expert's range so each output row is written exactly once.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void moe_gelu_mul_scatter_f16_to_f32_kernel(
+    const __half* __restrict__ in,              // [n_e, 2N]
+    const int32_t* __restrict__ sorted_token_ids, // [size_m]
+    float* __restrict__ out,                    // [size_m, N]
+    const int start,
+    const int N
+) {
+    const int row = blockIdx.x;
+    const int two_n = N << 1;
+    const __half* __restrict__ row_in = in + (size_t)row * two_n;
+    const int pair_idx = sorted_token_ids[start + row];
+    float* __restrict__ row_out = out + (size_t)pair_idx * N;
+    const float k0 = 0.7978845608028654f;       // sqrt(2/pi)
+    const float k1 = 0.044715f;
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        const float g = __half2float(row_in[n]);
+        const float u = __half2float(row_in[N + n]);
+        const float gelu = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
+        row_out[n] = gelu * u;
+    }
+}
+
+extern "C" void moe_gelu_mul_scatter_f16_to_f32(
+    const void* in_f16,
+    const int32_t* sorted_token_ids,
+    float* out_f32,
+    int n_e,
+    int start,
+    int N,
+    cudaStream_t stream
+) {
+    if (n_e <= 0) return;
+    const int block = (N < 256) ? N : 256;
+    dim3 grid(n_e, 1, 1);
+    dim3 blk(block, 1, 1);
+    moe_gelu_mul_scatter_f16_to_f32_kernel<<<grid, blk, 0, stream>>>(
+        (const __half*)in_f16, sorted_token_ids, out_f32, start, N
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Step 4: batched gather across all active experts.
+//
+// Writes a padded `[N_active, max_n_e, K]` F16 workspace where row
+// `(act_idx, m)` is `inputs[sorted_token_ids[expert_offsets[expert_ids[act_idx]] + m] / topk]`
+// for m < n_e[act_idx], or zero for m ≥ n_e[act_idx] (caller pre-zeroes).
+//
+// One launch processes ALL active experts:
+//   gridDim.x = max_n_e × K (block per output row; could be tightened)
+//   gridDim.y = N_active
+// Each block reads its expert's pair index, divides by topk, gathers.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void moe_batched_gather_input_rows_f32_to_f16_kernel(
+    const float* __restrict__ inputs,            // [num_real_tokens, K]
+    const int32_t* __restrict__ sorted_token_ids, // [size_m]
+    const int32_t* __restrict__ active_expert_ids,// [N_active]
+    const int32_t* __restrict__ expert_offsets,   // [num_experts + 1]
+    __half* __restrict__ out,                    // [N_active, max_n_e, K]
+    const int max_n_e,
+    const int K,
+    const int topk
+) {
+    const int act_idx = blockIdx.y;
+    const int row     = blockIdx.x;
+    const int expert  = active_expert_ids[act_idx];
+    const int start   = expert_offsets[expert];
+    const int end     = expert_offsets[expert + 1];
+    const int n_e     = end - start;
+
+    if (row >= n_e) return;  // Padding rows stay at the caller-zeroed value.
+
+    const int pair_idx    = sorted_token_ids[start + row];
+    const int real_token  = pair_idx / topk;
+    const float* __restrict__ src = inputs + (size_t)real_token * K;
+    __half*       __restrict__ dst = out
+        + ((size_t)act_idx * max_n_e + row) * K;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        dst[i] = __float2half(src[i]);
+    }
+}
+
+extern "C" void moe_batched_gather_input_rows_f32_to_f16(
+    const float* inputs,
+    const int32_t* sorted_token_ids,
+    const int32_t* active_expert_ids,
+    const int32_t* expert_offsets,
+    void* out_f16,
+    int n_active,
+    int max_n_e,
+    int K,
+    int topk,
+    cudaStream_t stream
+) {
+    if (n_active <= 0 || max_n_e <= 0) return;
+    const int block = (K < 256) ? K : 256;
+    dim3 grid(max_n_e, n_active, 1);
+    dim3 blk(block, 1, 1);
+    moe_batched_gather_input_rows_f32_to_f16_kernel<<<grid, blk, 0, stream>>>(
+        inputs, sorted_token_ids, active_expert_ids, expert_offsets,
+        (__half*)out_f16, max_n_e, K, topk
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Step 5 (Q4_K MMA path): batched F32 → Q8_1 gather quantize.
+//
+// Same dispatch shape as moe_batched_gather_input_rows_f32_to_f16, but the
+// per-row writes are Q8_1 blocks (one block per 32 K elements). Q8_1 is
+// the input format consumed by the m16n8k32 INT8 mma.sync path.
+//
+// Output layout: [N_active, max_n_e, K/32] block_q8_1.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void moe_batched_gather_input_rows_f32_to_q81_kernel(
+    const float* __restrict__ inputs,            // [num_real_tokens, K]
+    const int32_t* __restrict__ sorted_token_ids, // [size_m]
+    const int32_t* __restrict__ active_expert_ids,// [N_active]
+    const int32_t* __restrict__ expert_offsets,   // [num_experts + 1]
+    void* __restrict__ out,                      // [N_active, max_n_e, K/32] block_q8_1
+    const int max_n_e,
+    const int K,
+    const int topk
+) {
+    // 36-byte Q8_1 block: __half2 ds + 32 int8 qs.
+    // NOTE: must NOT be __align__(8) — that would pad to 40 bytes and
+    // break the MMA kernel's struct stride (block_q8_1_mma is 36 bytes).
+    struct block_q8_1_local {
+        __half2 ds;
+        int8_t  qs[32];
+    };
+
+    const int act_idx  = blockIdx.y;
+    const int row      = blockIdx.x;
+    const int kb       = blockIdx.z;                // K-block index (0..K/32-1)
+    const int num_blks = K / 32;
+
+    const int expert  = active_expert_ids[act_idx];
+    const int start   = expert_offsets[expert];
+    const int end     = expert_offsets[expert + 1];
+    const int n_e     = end - start;
+
+    if (row >= n_e || kb >= num_blks) return;
+
+    const int pair_idx   = sorted_token_ids[start + row];
+    const int real_token = pair_idx / topk;
+    const float* __restrict__ src = inputs + (size_t)real_token * K + kb * 32;
+    block_q8_1_local* __restrict__ dst = (block_q8_1_local*) out
+        + ((size_t)act_idx * max_n_e + row) * num_blks + kb;
+
+    // 32 threads cooperate on this 32-element block. Each loads one float.
+    const int t = threadIdx.x;
+    float x = src[t];
+
+    // Warp-reduce max(|x|) across the 32 lanes for the absmax scale.
+    float ax = fabsf(x);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        ax = fmaxf(ax, __shfl_xor_sync(0xffffffff, ax, off));
+    }
+    const float d = ax / 127.f;
+    const float inv_d = (d != 0.f) ? (1.f / d) : 0.f;
+
+    // Quantize and warp-reduce sum for Q8_1's `s` (sum scaled by d).
+    int q = __float2int_rn(x * inv_d);
+    q = max(-127, min(127, q));
+    int s_int = q;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s_int += __shfl_xor_sync(0xffffffff, s_int, off);
+    }
+    const float sum_scaled = (float)s_int * d;
+
+    dst->qs[t] = (int8_t)q;
+    if (t == 0) {
+        dst->ds = __floats2half2_rn(d, sum_scaled);
+    }
+}
+
+extern "C" void moe_batched_gather_input_rows_f32_to_q81(
+    const float* inputs,
+    const int32_t* sorted_token_ids,
+    const int32_t* active_expert_ids,
+    const int32_t* expert_offsets,
+    void* out_q81,
+    int n_active,
+    int max_n_e,
+    int K,
+    int topk,
+    cudaStream_t stream
+) {
+    if (n_active <= 0 || max_n_e <= 0 || K <= 0) return;
+    const int num_blks = K / 32;
+    dim3 grid(max_n_e, n_active, num_blks);
+    dim3 blk(32, 1, 1);
+    moe_batched_gather_input_rows_f32_to_q81_kernel<<<grid, blk, 0, stream>>>(
+        inputs, sorted_token_ids, active_expert_ids, expert_offsets,
+        out_q81, max_n_e, K, topk
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Step 4: batched GELU·mul + scatter across all active experts.
+//
+// Reads the padded GEMM output `[N_active, max_n_e, 2N]` F16 and for each
+// valid `(act_idx, m)` row (m < n_e[act_idx]) computes
+//   gelu(in[..N]) * in[N..2N]
+// then scatters into `out[sorted_token_ids[start + m], :]` F32.
+//
+// One launch processes ALL active experts. Padding rows (m ≥ n_e[act_idx])
+// produce no output; the caller has pre-zeroed the F32 output buffer.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void moe_batched_gelu_mul_scatter_f16_to_f32_kernel(
+    const __half* __restrict__ in,                // [N_active, max_n_e, 2N]
+    const int32_t* __restrict__ sorted_token_ids,  // [size_m]
+    const int32_t* __restrict__ active_expert_ids, // [N_active]
+    const int32_t* __restrict__ expert_offsets,    // [num_experts + 1]
+    float* __restrict__ out,                       // [size_m, N]
+    const int max_n_e,
+    const int N
+) {
+    const int act_idx = blockIdx.y;
+    const int row     = blockIdx.x;
+    const int expert  = active_expert_ids[act_idx];
+    const int start   = expert_offsets[expert];
+    const int end     = expert_offsets[expert + 1];
+    const int n_e     = end - start;
+    if (row >= n_e) return;
+
+    const int two_n = N << 1;
+    const __half* __restrict__ row_in = in
+        + ((size_t)act_idx * max_n_e + row) * two_n;
+    const int pair_idx = sorted_token_ids[start + row];
+    float* __restrict__ row_out = out + (size_t)pair_idx * N;
+
+    const float k0 = 0.7978845608028654f;       // sqrt(2/pi)
+    const float k1 = 0.044715f;
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        const float g = __half2float(row_in[n]);
+        const float u = __half2float(row_in[N + n]);
+        const float gelu = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
+        row_out[n] = gelu * u;
+    }
+}
+
+extern "C" void moe_batched_gelu_mul_scatter_f16_to_f32(
+    const void* in_f16,
+    const int32_t* sorted_token_ids,
+    const int32_t* active_expert_ids,
+    const int32_t* expert_offsets,
+    float* out_f32,
+    int n_active,
+    int max_n_e,
+    int N,
+    cudaStream_t stream
+) {
+    if (n_active <= 0 || max_n_e <= 0) return;
+    const int block = (N < 256) ? N : 256;
+    dim3 grid(max_n_e, n_active, 1);
+    dim3 blk(block, 1, 1);
+    moe_batched_gelu_mul_scatter_f16_to_f32_kernel<<<grid, blk, 0, stream>>>(
+        (const __half*)in_f16, sorted_token_ids, active_expert_ids,
+        expert_offsets, out_f32, max_n_e, N
+    );
+}
+
+// F32 input variant — used when the MMA path writes F32 directly to avoid
+// the F16 intermediate rounding step that compounds through layers.
+extern "C" __global__ void moe_batched_gelu_mul_scatter_f32_to_f32_kernel(
+    const float* __restrict__ in,                 // [N_active, max_n_e, 2N]
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ active_expert_ids,
+    const int32_t* __restrict__ expert_offsets,
+    float* __restrict__ out,                      // [size_m, N]
+    const int max_n_e,
+    const int N
+) {
+    const int act_idx = blockIdx.y;
+    const int row     = blockIdx.x;
+    const int expert  = active_expert_ids[act_idx];
+    const int start   = expert_offsets[expert];
+    const int end     = expert_offsets[expert + 1];
+    const int n_e     = end - start;
+    if (row >= n_e) return;
+
+    const int two_n = N << 1;
+    const float* __restrict__ row_in = in
+        + ((size_t)act_idx * max_n_e + row) * two_n;
+    const int pair_idx = sorted_token_ids[start + row];
+    float* __restrict__ row_out = out + (size_t)pair_idx * N;
+
+    const float k0 = 0.7978845608028654f;
+    const float k1 = 0.044715f;
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        const float g = row_in[n];
+        const float u = row_in[N + n];
+        const float gelu = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
+        row_out[n] = gelu * u;
+    }
+}
+
+extern "C" void moe_batched_gelu_mul_scatter_f32_to_f32(
+    const float* in_f32,
+    const int32_t* sorted_token_ids,
+    const int32_t* active_expert_ids,
+    const int32_t* expert_offsets,
+    float* out_f32,
+    int n_active,
+    int max_n_e,
+    int N,
+    cudaStream_t stream
+) {
+    if (n_active <= 0 || max_n_e <= 0) return;
+    const int block = (N < 256) ? N : 256;
+    dim3 grid(max_n_e, n_active, 1);
+    dim3 blk(block, 1, 1);
+    moe_batched_gelu_mul_scatter_f32_to_f32_kernel<<<grid, blk, 0, stream>>>(
+        in_f32, sorted_token_ids, active_expert_ids,
+        expert_offsets, out_f32, max_n_e, N
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Step 4: batched per-expert Q4_K → F16 dequantize.
+//
+// Replaces the per-expert dequant loop with a SINGLE kernel launch that
+// dequantizes ALL active experts' [2N, K] slabs into a contiguous
+// [N_active, 2N, K] F16 workspace. Block layout:
+//   gridDim.x = blocks_per_expert = 2N × K / 256
+//   gridDim.y = N_active
+//   blockDim.x = 32 (one thread per Q4_K nibble pair)
+//
+// Each block dequantizes one Q4_K super-block (256 elements) for one
+// active expert. The expert is looked up via active_expert_ids[blockIdx.y]
+// so callers can pass a sparse list of which experts to materialise.
+//
+// The inner dequant math is the standard Q4_K layout:
+//   dall = low(dm), dmin = high(dm); per-half scale/min via 6-bit packed
+//   scales[12]; 256 elements produced by interleaved nibble lanes.
+//
+// One launch replaces N_active separate dequant launches — eliminates
+// the per-expert kernel-launch overhead that the hoisted-workspace form
+// still had.
+// ─────────────────────────────────────────────────────────────────────────
+namespace moe_batched_q4k {
+
+#define QK_K_BATCH 256
+
+typedef struct {
+    __half2 dm;
+    uint8_t scales[12];
+    uint8_t qs[128];
+} block_q4_K_b;
+
+static_assert(sizeof(block_q4_K_b) == 4 + 12 + 128, "block_q4_K_b size");
+
+__device__ __forceinline__ void get_scale_min_k4_b(
+    int j, const uint8_t * q, uint8_t & d, uint8_t & m
+) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+
+}
+
+extern "C" __global__ void moe_batched_dequant_q4k_f16_kernel(
+    const void * __restrict__ all_weights,
+    const int32_t * __restrict__ active_expert_ids,
+    __half * __restrict__ out,
+    int blocks_per_expert
+) {
+    using namespace moe_batched_q4k;
+    const int block_idx = blockIdx.x;
+    const int act_idx   = blockIdx.y;
+    const int tid       = threadIdx.x;
+
+    const int expert = active_expert_ids[act_idx];
+    const block_q4_K_b * x = (const block_q4_K_b *) all_weights
+                            + (size_t)expert * blocks_per_expert
+                            + block_idx;
+    __half * y = out + ((size_t)act_idx * blocks_per_expert + block_idx) * QK_K_BATCH;
+
+    const int il = tid / 8;
+    const int ir = tid % 8;
+    const int is = 2 * il;
+    const int n  = 4;
+
+    const float dall = __low2half(x->dm);
+    const float dmin = __high2half(x->dm);
+    const uint8_t * q = x->qs + 32 * il + n * ir;
+
+    uint8_t sc, m;
+    get_scale_min_k4_b(is + 0, x->scales, sc, m);
+    const float d1 = dall * sc;
+    const float m1 = dmin * m;
+    get_scale_min_k4_b(is + 1, x->scales, sc, m);
+    const float d2 = dall * sc;
+    const float m2 = dmin * m;
+
+    __half * y_row = y + 64 * il + n * ir;
+    for (int l = 0; l < n; ++l) {
+        y_row[l + 0 ] = __float2half(d1 * (float)(q[l] & 0xF) - m1);
+        y_row[l + 32] = __float2half(d2 * (float)(q[l] >>  4) - m2);
+    }
+}
+
+extern "C" void moe_batched_dequant_q4k_f16(
+    const void* all_weights,
+    const int32_t* active_expert_ids,
+    void* out_f16,
+    int n_active,
+    int rows_per_expert,
+    int cols,
+    cudaStream_t stream
+) {
+    if (n_active <= 0) return;
+    const int blocks_per_expert = (rows_per_expert * cols) / QK_K_BATCH;
+    dim3 grid(blocks_per_expert, n_active, 1);
+    dim3 blk(32, 1, 1);
+    moe_batched_dequant_q4k_f16_kernel<<<grid, blk, 0, stream>>>(
+        all_weights, active_expert_ids, (__half*)out_f16, blocks_per_expert
+    );
+}
+
 namespace vllm_rs {
 
 /*
@@ -52,7 +592,21 @@ namespace vllm_rs {
  * @param size_k              Input feature dimension (K dimension)
  * @param k_padded            Padded K dimension for GGUF stride
 */
-template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+// Multi-row MMVQ kernel — each warp computes ROWS_PER_WARP output rows
+// for the same (token, expert). The input quantized vector (`y_ptr`) is
+// shared across rows — loaded once via L1/L2 and reused by all
+// `ROWS_PER_WARP` dot products inside the warp's inner loop. Halves
+// (or quarters) the grid size compared to the 1-row-per-warp version
+// while keeping the dot-product kernel structure unchanged.
+//
+// Pattern adapted from llama.cpp's `mul_mat_vec_q` `tmp[ncols_dst][rows_per_cuda_block]`
+// accumulator. We keep ncols_dst==1 (each block still maps to one m_idx
+// = one (token, expert)) since MoE expert routing makes m_idx values
+// route to different experts, so weights can't be shared across m_idx.
+// What we CAN share is the input across multiple output rows — that's
+// what ROWS_PER_WARP does.
+template <int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ROWS_PER_WARP>
 __global__ void moe_gemm_gguf_kernel(
     const void * __restrict__ all_weights,       // [num_experts, N, K] (quantized)
     const void * __restrict__ all_inputs,        // [M_total, K] (quantized, M_total is total tokens)
@@ -68,27 +622,24 @@ __global__ void moe_gemm_gguf_kernel(
     const int laneId = threadIdx.x;
     const int wrapId = threadIdx.y;
     const int nWraps = blockDim.y;
-    const int row = blockIdx.x * nWraps + wrapId; // This is the 'n' dimension (output row)
-    const int m_idx = blockIdx.y; // This is the 'm' dimension (token index)
-    
-    // This block computes the dot product for `output[token_id][n_row]`
-    
-    if (row >= size_n || m_idx >= size_m) {
+    // First output row this warp computes. Block computes
+    // nWraps * ROWS_PER_WARP rows; warp computes ROWS_PER_WARP
+    // contiguous rows starting here.
+    const int row0 = blockIdx.x * nWraps * ROWS_PER_WARP + wrapId * ROWS_PER_WARP;
+    const int m_idx = blockIdx.y;
+
+    if (row0 >= size_n || m_idx >= size_m) {
         return;
     }
 
-    // strides
     const size_t weight_expert_stride_bytes = (size_t)(size_n * size_k) / qk * sizeof(block_q_t);
     const size_t input_task_stride_bytes    = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
     const size_t output_task_stride_elems   = (size_t)size_n;
 
-    const int token_id = sorted_token_ids[m_idx]; // The *actual* row in input/output tensors
+    const int token_id = sorted_token_ids[m_idx];
     const int expert = expert_ids[m_idx];
-    
-    // If expert is invalid, this token does not participate.
     if (expert < 0 || expert >= num_experts) return;
 
-    // Get the scaling factor for this token/expert pair
     const float scale = (topk_weights) ? topk_weights[token_id] : 1.0f;
 
     const block_q_t * __restrict__ w_expert =
@@ -98,44 +649,65 @@ __global__ void moe_gemm_gguf_kernel(
     const block_q8_1 * __restrict__ y_ptr =
         (const block_q8_1 *)((const char *)all_inputs + (size_t)input_index * input_task_stride_bytes);
 
-    // dot-product tiling along k
     const int blocks_per_row_x = size_k / qk;
-    const int blocks_per_iter  = vdr * WARP_SIZE / qi; // no nwarps factor: one warp per batch item
+    const int blocks_per_iter  = vdr * WARP_SIZE / qi;
 
+    // Shared memory holds nWraps × ROWS_PER_WARP weight rows. Each warp
+    // loads its ROWS_PER_WARP contiguous rows.
     extern __shared__ int8_t shared_bytes[];
-    block_q_t* w_shared_row = reinterpret_cast<block_q_t*>(shared_bytes);
-    for (int i = laneId; i < blocks_per_row_x; i += WARP_SIZE) {
-        w_shared_row[wrapId * blocks_per_row_x + i] = w_expert[row * blocks_per_row_x + i];
+    block_q_t* w_shared = reinterpret_cast<block_q_t*>(shared_bytes);
+    block_q_t* w_shared_warp = w_shared + (size_t)wrapId * ROWS_PER_WARP * blocks_per_row_x;
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        const int row = row0 + r;
+        if (row < size_n) {
+            for (int i = laneId; i < blocks_per_row_x; i += WARP_SIZE) {
+                w_shared_warp[r * blocks_per_row_x + i] = w_expert[row * blocks_per_row_x + i];
+            }
+        }
     }
     __syncthreads();
 
-    // accumulators for rows_per_block rows (usually 1)
-    float acc = 0.0f;
+    float acc[ROWS_PER_WARP];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) acc[r] = 0.0f;
 
     #pragma unroll
     for (int kbx = laneId / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk / QK8_1);
         const int kqs = vdr * (laneId % (qi / vdr));
-        acc += vec_dot_q_cuda(
-            // &w_expert[kbx + row * blocks_per_row_x],
-            &w_shared_row[wrapId * blocks_per_row_x + kbx],
-            &y_ptr[kby],
-            kqs);
+        // Same y_ptr block serves all ROWS_PER_WARP dot products — it
+        // hits L1/L2 once and stays cached across the unrolled loop.
+        const block_q8_1 * y_blk = &y_ptr[kby];
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            acc[r] += vec_dot_q_cuda(
+                &w_shared_warp[r * blocks_per_row_x + kbx],
+                y_blk,
+                kqs);
+        }
     }
 
-    float v = warp_reduce_sum(acc) * scale;
-    if (laneId == 0) {
-        float * __restrict__ out_ptr =
-            all_outputs + ((size_t)token_id) * output_task_stride_elems;
-        out_ptr[row] = v;
+    float * __restrict__ out_ptr =
+        all_outputs + ((size_t)token_id) * output_task_stride_elems;
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        const int row = row0 + r;
+        if (row < size_n) {
+            const float v = warp_reduce_sum(acc[r]) * scale;
+            if (laneId == 0) {
+                out_ptr[row] = v;
+            }
+        }
     }
 }
 
 }
 
 #define LAUNCH_MOE_GGUF(qk, qi, block_q_t, vdr, vec_dot_q_cuda) \
-    const int shared_bytes = size_k / qk * sizeof(block_q_t) * nWraps + 1024;\
-    vllm_rs::moe_gemm_gguf_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda> \
+    /* Shared mem: nWraps × ROWS_PER_WARP weight rows × bytes-per-row */ \
+    const int shared_bytes = size_k / qk * sizeof(block_q_t) * nWraps * ROWS_PER_WARP + 1024;\
+    vllm_rs::moe_gemm_gguf_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda, ROWS_PER_WARP> \
         <<<grid_dim, block_dim, shared_bytes, stream>>>(\
         weights, y_q8_1,\
         sorted_token_ids, expert_ids, topk_weights,\
@@ -173,8 +745,15 @@ extern "C" void moe_gemm_gguf(
     cudaMallocAsync(&y_q8_1, y_size_in_bytes, stream);
     quantize_q8_1<<<grid_dim_quant, block_dim_quant, 0, stream>>>(inputs, y_q8_1, size_k, kx_padded);
 
+    // ROWS_PER_WARP > 1 doubles the per-block shared-memory cost
+    // (each warp now caches that many weight rows). On Blackwell the
+    // shared-mem-per-block ceiling clamps blocks-resident-per-SM to 1
+    // for ROWS_PER_WARP=2 with K=2048 K-quants, which underutilizes
+    // SMs when grid_x is small (e.g. moe_intermediate=768 → grid_x=96).
+    // Keep =1; experiment with larger only when matmul shape favors it.
     const int nWraps = 4;
-    dim3 grid_dim(ceil_div(size_n, nWraps), size_m, 1);
+    constexpr int ROWS_PER_WARP = 1;
+    dim3 grid_dim(ceil_div(size_n, nWraps * ROWS_PER_WARP), size_m, 1);
     dim3 block_dim(WARP_SIZE, nWraps, 1);
 
     //Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5,
@@ -209,8 +788,640 @@ extern "C" void moe_gemm_gguf(
             LAUNCH_MOE_GGUF(QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1);
             break;
         }
+        case 6: // Q5_0
+        {
+            LAUNCH_MOE_GGUF(QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1);
+            break;
+        }
         default:
             break;
+    }
+    cudaFreeAsync(y_q8_1, stream);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MoE down-projection GEMM with topk reduction fused inline.
+//
+// Replaces the sequence
+//   ys = moe_gemm_gguf(down_inputs, down_w, topk_weights)  // [M*topk, hidden]
+//   ys = ys.reshape((M, topk, hidden))?.sum(D::Minus2)?    // [M, hidden]
+// with a single CUDA launch that writes scaled partial results directly
+// to a pre-zeroed [M, hidden] output via atomicAdd. Saves the explicit
+// sum() launch and the [M*topk, hidden] intermediate.
+//
+// For decode (M=1 real token, topk=8): each (token, expert) pair adds
+// its weighted contribution to the same output row. atomicAdd on F32
+// has minimal contention at this scale (8 contributors per output
+// position scattered across hidden=2048 lanes).
+// ─────────────────────────────────────────────────────────────────────────
+namespace vllm_rs {
+
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__global__ void moe_gemm_gguf_down_reduce_kernel(
+    const void * __restrict__ all_weights,       // [num_experts, N=hidden, K=moe_inter]
+    const void * __restrict__ all_inputs,        // [M_total, K]
+    const int32_t* __restrict__ sorted_token_ids,// [M]
+    const int32_t* __restrict__ expert_ids,      // [M]
+    const float*  __restrict__ topk_weights,     // [M_total]
+    float * __restrict__ all_outputs,            // [num_real_tokens, N]
+                                                 // pre-initialized to either zeros (alloc_zeros)
+                                                 // or to residual (cast F16→F32) — caller's choice.
+                                                 // Kernel just atomicAdds its contribution.
+    int num_experts,
+    int topk,
+    int size_m, int size_n, int size_k,
+    int k_padded
+) {
+    const int laneId = threadIdx.x;
+    const int wrapId = threadIdx.y;
+    const int nWraps = blockDim.y;
+    const int row = blockIdx.x * nWraps + wrapId;
+    const int m_idx = blockIdx.y;
+
+    if (row >= size_n || m_idx >= size_m) return;
+
+    const size_t weight_expert_stride_bytes = (size_t)(size_n * size_k) / qk * sizeof(block_q_t);
+    const size_t input_task_stride_bytes    = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const size_t output_task_stride_elems   = (size_t)size_n;
+
+    const int token_id = sorted_token_ids[m_idx];
+    const int expert   = expert_ids[m_idx];
+    if (expert < 0 || expert >= num_experts) return;
+
+    const float scale = topk_weights[token_id];
+
+    const block_q_t * __restrict__ w_expert =
+        (const block_q_t *)((const char *)all_weights + (size_t)expert * weight_expert_stride_bytes);
+
+    // Down's input is per-(token, expert) — input_index is just token_id.
+    const block_q8_1 * __restrict__ y_ptr =
+        (const block_q8_1 *)((const char *)all_inputs + (size_t)token_id * input_task_stride_bytes);
+
+    const int blocks_per_row_x = size_k / qk;
+    const int blocks_per_iter  = vdr * WARP_SIZE / qi;
+
+    // No shared-mem weight cache (reads from global; L1 handles reuse).
+    float acc = 0.0f;
+    #pragma unroll
+    for (int kbx = laneId / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (laneId % (qi / vdr));
+        acc += vec_dot_q_cuda(
+            &w_expert[row * blocks_per_row_x + kbx],
+            &y_ptr[kby],
+            kqs);
+    }
+
+    const float v = warp_reduce_sum(acc) * scale;
+    if (laneId == 0) {
+        const int real_token = token_id / topk;
+        float * __restrict__ out_ptr =
+            all_outputs + ((size_t)real_token) * output_task_stride_elems;
+        atomicAdd(&out_ptr[row], v);
+    }
+}
+
+} // namespace vllm_rs
+
+#define LAUNCH_MOE_GGUF_DOWN_REDUCE(qk, qi, block_q_t, vdr, vec_dot_q_cuda) \
+    /* No shared-mem weight cache. */ \
+    const int shared_bytes_dr = 0; \
+    vllm_rs::moe_gemm_gguf_down_reduce_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda> \
+        <<<grid_dim, block_dim, shared_bytes_dr, stream>>>( \
+        weights, y_q8_1, \
+        sorted_token_ids, expert_ids, topk_weights, \
+        outputs, \
+        num_experts, topk, \
+        size_m, size_n, size_k, \
+        kx_padded \
+    );
+
+// Initialize an F32 output buffer from an F16 residual. Used to fuse
+// the post-MLP residual add into the moe_gemm_gguf_down_reduce kernel:
+// instead of alloc_zeros + atomicAdd contributions + later add_residual,
+// we init the buffer to residual values then atomicAdd contributions —
+// the residual add is "free" (one initial cast + write per element).
+__global__ void init_f32_from_f16(float* __restrict__ dst, const __half* __restrict__ src, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(src[i]);
+}
+__global__ void init_f32_from_bf16(float* __restrict__ dst, const __nv_bfloat16* __restrict__ src, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __bfloat162float(src[i]);
+}
+
+extern "C" void cast_init_f32_from_dtype(
+    float* dst,
+    const void* src,
+    int n,
+    int dtype,                      // 0=f16, 1=bf16
+    cudaStream_t stream
+) {
+    const int block = 256;
+    const int grid = (n + block - 1) / block;
+    if (dtype == 0) {
+        init_f32_from_f16<<<grid, block, 0, stream>>>(dst, (const __half*)src, n);
+    } else {
+#ifndef NO_BF16_KERNEL
+        init_f32_from_bf16<<<grid, block, 0, stream>>>(dst, (const __nv_bfloat16*)src, n);
+#endif
+    }
+}
+
+extern "C" void moe_gemm_gguf_down_reduce(
+    const float* inputs,            // [M*topk, K] f32
+    const void*  weights,           // [num_experts, N, K] quantized
+    const int32_t* sorted_token_ids,
+    const int32_t* expert_ids,
+    const float* topk_weights,      // [M*topk] f32 — required (not optional)
+    float* outputs,                 // [num_real_tokens, N] f32 — caller MUST pre-zero
+    int num_experts,
+    int topk,
+    int size_m,                     // M*topk (entries to process)
+    int size_n,                     // hidden
+    int size_k,                     // moe_inter
+    int quant_type,
+    cudaStream_t stream
+) {
+    const int QUANTIZE_BLOCK_SIZE = CUDA_QUANTIZE_BLOCK_SIZE;
+    const int kx_padded = pad(size_k, MATRIX_ROW_PADDING);
+    const int num_blocks = ceil_div(kx_padded, QUANTIZE_BLOCK_SIZE);
+    int m_in = size_m; // down has its own per-(token,expert) input
+    dim3 grid_dim_quant(num_blocks, m_in, 1);
+    dim3 block_dim_quant(QUANTIZE_BLOCK_SIZE, 1, 1);
+    int y_size_in_bytes = m_in * (kx_padded / QK8_1 * sizeof(block_q8_1));
+    void* y_q8_1 = nullptr;
+    cudaMallocAsync(&y_q8_1, y_size_in_bytes, stream);
+    quantize_q8_1<<<grid_dim_quant, block_dim_quant, 0, stream>>>(inputs, y_q8_1, size_k, kx_padded);
+
+    // Smaller blocks → more parallelism across SMs (no shared-mem
+    // barrier means small blocks are fine). Down has size_n=hidden,
+    // typically much larger than gate/up's size_n=moe_inter, so the
+    // grid is already big at nWraps=4; leaving =2 for symmetry and
+    // marginally better SM occupancy on small batches.
+    const int nWraps = 2;
+    dim3 grid_dim(ceil_div(size_n, nWraps), size_m, 1);
+    dim3 block_dim(WARP_SIZE, nWraps, 1);
+
+    switch (quant_type) {
+        case 0: { LAUNCH_MOE_GGUF_DOWN_REDUCE(QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1); break; }
+        case 1: { LAUNCH_MOE_GGUF_DOWN_REDUCE(QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1); break; }
+        case 2: { LAUNCH_MOE_GGUF_DOWN_REDUCE(QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1); break; }
+        case 3: { LAUNCH_MOE_GGUF_DOWN_REDUCE(QK_K,  QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1); break; }
+        case 4: { LAUNCH_MOE_GGUF_DOWN_REDUCE(QK_K,  QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1); break; }
+        case 5: { LAUNCH_MOE_GGUF_DOWN_REDUCE(QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1); break; }
+        case 6: { LAUNCH_MOE_GGUF_DOWN_REDUCE(QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1); break; }
+        default: break;
+    }
+    cudaFreeAsync(y_q8_1, stream);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Fused gate+up MoE GEMM with SiLU activation and elementwise multiply.
+//
+// Computes:    output[m, n] = silu(dot(gate_w[expert][n], input[m])) *
+//                                    dot(up_w[expert][n],   input[m])
+//
+// Compared to running moe_gemm_gguf twice (once for gate, once for up) and
+// then a separate silu+mul elementwise kernel, this fused kernel:
+//   • shares the quantize_q8_1 of the input (one launch instead of two —
+//     the input was already shared, but the host-side kernel invocations
+//     each did a separate quantize alloc),
+//   • shares the *load* of `y_ptr` block bytes from L1/L2 across the gate
+//     and up partial-sum loops (one trip through global memory for the
+//     input vector, used twice),
+//   • writes a single [M, N] output instead of two [M, N] intermediates +
+//     one [M, N] final, halving global-memory write bandwidth and
+//     eliminating the activation-and-multiply launches.
+//
+// llama.cpp's MMVQ does this via a `vgate` / `tmp_gate` template parameter;
+// here we keep the existing kernel template and add a sibling that takes
+// gate and up weights as separate pointers.
+// ─────────────────────────────────────────────────────────────────────────
+namespace vllm_rs {
+
+template <int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ROWS_PER_WARP>
+__global__ void moe_gemm_gguf_gate_up_silu_mul_kernel(
+    const void * __restrict__ gate_weights,      // [num_experts, N, K] (quantized)
+    const void * __restrict__ up_weights,        // [num_experts, N, K] (quantized)
+    const void * __restrict__ all_inputs,        // [M_total, K] (quantized)
+    const int32_t* __restrict__ sorted_token_ids,// [M]
+    const int32_t* __restrict__ expert_ids,      // [M]
+    float * __restrict__ all_outputs,            // [M_total, N] (float, fused output)
+    int num_experts,
+    int topk,
+    int size_m, int size_n, int size_k,
+    int k_padded
+) {
+    const int laneId = threadIdx.x;
+    const int wrapId = threadIdx.y;
+    const int nWraps = blockDim.y;
+    // Each warp computes ROWS_PER_WARP contiguous output rows. Block
+    // computes nWraps × ROWS_PER_WARP rows total.
+    const int row0 = blockIdx.x * nWraps * ROWS_PER_WARP + wrapId * ROWS_PER_WARP;
+    const int m_idx = blockIdx.y;
+
+    if (row0 >= size_n || m_idx >= size_m) {
+        return;
+    }
+
+    const size_t weight_expert_stride_bytes = (size_t)(size_n * size_k) / qk * sizeof(block_q_t);
+    const size_t input_task_stride_bytes    = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const size_t output_task_stride_elems   = (size_t)size_n;
+
+    const int token_id = sorted_token_ids[m_idx];
+    const int expert   = expert_ids[m_idx];
+    if (expert < 0 || expert >= num_experts) return;
+
+    const block_q_t * __restrict__ wg_expert =
+        (const block_q_t *)((const char *)gate_weights + (size_t)expert * weight_expert_stride_bytes);
+    const block_q_t * __restrict__ wu_expert =
+        (const block_q_t *)((const char *)up_weights   + (size_t)expert * weight_expert_stride_bytes);
+
+    // Gate/up don't apply topk_weights (only down does) — input_index is
+    // the same as in the unfused gate/up kernel call: token_id / topk.
+    const int input_index = token_id / topk;
+    const block_q8_1 * __restrict__ y_ptr =
+        (const block_q8_1 *)((const char *)all_inputs + (size_t)input_index * input_task_stride_bytes);
+
+    const int blocks_per_row_x = size_k / qk;
+    const int blocks_per_iter  = vdr * WARP_SIZE / qi;
+
+    // No shared-mem weight cache. Reading weights directly from global
+    // hits L1/L2 — for typical hidden sizes the working set fits and
+    // the saved shared mem lets MORE blocks reside per SM, improving
+    // occupancy. Pattern matches llama.cpp's MMVQ kernel.
+    float acc_g[ROWS_PER_WARP];
+    float acc_u[ROWS_PER_WARP];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) { acc_g[r] = 0.0f; acc_u[r] = 0.0f; }
+
+    #pragma unroll
+    for (int kbx = laneId / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (laneId % (qi / vdr));
+        const block_q8_1 * y_blk = &y_ptr[kby];
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            const int row = row0 + r;
+            if (row < size_n) {
+                acc_g[r] += vec_dot_q_cuda(&wg_expert[row * blocks_per_row_x + kbx], y_blk, kqs);
+                acc_u[r] += vec_dot_q_cuda(&wu_expert[row * blocks_per_row_x + kbx], y_blk, kqs);
+            }
+        }
+    }
+
+    float * __restrict__ out_ptr =
+        all_outputs + ((size_t)token_id) * output_task_stride_elems;
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        const int row = row0 + r;
+        if (row < size_n) {
+            const float g = warp_reduce_sum(acc_g[r]);
+            const float u = warp_reduce_sum(acc_u[r]);
+            if (laneId == 0) {
+                const float silu_g = g / (1.0f + __expf(-g));
+                out_ptr[row] = silu_g * u;
+            }
+        }
+    }
+}
+
+} // namespace vllm_rs
+
+#define LAUNCH_MOE_GGUF_GATE_UP(qk, qi, block_q_t, vdr, vec_dot_q_cuda) \
+    /* Kernel reads weights from global; only need a tiny stub for the */ \
+    /* dynamic-shared-mem extern declaration. */ \
+    const int shared_bytes_gu = 0; \
+    vllm_rs::moe_gemm_gguf_gate_up_silu_mul_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda, ROWS_PER_WARP> \
+        <<<grid_dim, block_dim, shared_bytes_gu, stream>>>( \
+        gate_weights, up_weights, y_q8_1, \
+        sorted_token_ids, expert_ids, \
+        outputs, \
+        num_experts, topk, \
+        size_m, size_n, size_k, \
+        kx_padded \
+    );
+
+extern "C" void moe_gemm_gguf_gate_up_silu_mul(
+    const float* inputs,
+    const void* gate_weights,
+    const void* up_weights,
+    const int32_t* sorted_token_ids,
+    const int32_t* expert_ids,
+    float* outputs,
+    int num_experts,
+    int topk,
+    int size_m,
+    int size_n,
+    int size_k,
+    int quant_type,
+    cudaStream_t stream
+) {
+    const int QUANTIZE_BLOCK_SIZE = CUDA_QUANTIZE_BLOCK_SIZE;
+    const int kx_padded = pad(size_k, MATRIX_ROW_PADDING);
+    const int num_blocks = ceil_div(kx_padded, QUANTIZE_BLOCK_SIZE);
+    int m_in = size_m / topk;
+    dim3 grid_dim_quant(num_blocks, m_in, 1);
+    dim3 block_dim_quant(QUANTIZE_BLOCK_SIZE, 1, 1);
+    int y_size_in_bytes = m_in * (kx_padded / QK8_1 * sizeof(block_q8_1));
+    void* y_q8_1 = nullptr;
+    cudaMallocAsync(&y_q8_1, y_size_in_bytes, stream);
+    quantize_q8_1<<<grid_dim_quant, block_dim_quant, 0, stream>>>(inputs, y_q8_1, size_k, kx_padded);
+
+    // Without shared-mem barriers we can use smaller blocks to spread
+    // work across more SMs. For typical MoE intermediate sizes (768) at
+    // nWraps=4 we'd only generate 192 blocks (1.5/SM on a 128-SM card).
+    // nWraps=2 doubles block count to 384, ~3 blocks/SM — better.
+    const int nWraps = 2;
+    constexpr int ROWS_PER_WARP = 1;
+    dim3 grid_dim(ceil_div(size_n, nWraps * ROWS_PER_WARP), size_m, 1);
+    dim3 block_dim(WARP_SIZE, nWraps, 1);
+
+    switch (quant_type) {
+        case 0: { LAUNCH_MOE_GGUF_GATE_UP(QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1); break; }
+        case 1: { LAUNCH_MOE_GGUF_GATE_UP(QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1); break; }
+        case 2: { LAUNCH_MOE_GGUF_GATE_UP(QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1); break; }
+        case 3: { LAUNCH_MOE_GGUF_GATE_UP(QK_K,  QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1); break; }
+        case 4: { LAUNCH_MOE_GGUF_GATE_UP(QK_K,  QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1); break; }
+        case 5: { LAUNCH_MOE_GGUF_GATE_UP(QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1); break; }
+        default: break;
+    }
+    cudaFreeAsync(y_q8_1, stream);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// MoE gate||up GEMM with GELU(tanh) activation and elementwise multiply,
+// for the gemma4-MoE concat weight layout where gate and up share one
+// [num_experts, 2*N, K] tensor (gate = rows 0..N, up = rows N..2N).
+//
+// Replaces the gemma4 MoE FFN sequence:
+//   gu = moe_gemm_gguf(input, gate_up_exps)         // [M*topk, 2N]
+//   gate_act = gelu_tanh(gu[:, :N]); down_in = gate_act * gu[:, N:]
+// with a single fused matmul that emits the activated [M*topk, N] output
+// directly, saving the [2N] intermediate write + the activation+mul
+// elementwise launches.
+// ───────────────────────────────────────────────────────────────────────
+namespace vllm_rs {
+
+template <int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ROWS_PER_WARP>
+__global__ void moe_gemm_gguf_gate_up_gelu_mul_concat_kernel(
+    const void * __restrict__ gate_up_weights,   // [num_experts, 2*N, K] (quantized, gate||up)
+    const void * __restrict__ all_inputs,        // [M_total, K] (quantized)
+    const int32_t* __restrict__ sorted_token_ids,// [M]
+    const int32_t* __restrict__ expert_ids,      // [M]
+    float * __restrict__ all_outputs,            // [M_total, N] (gelu(gate) * up)
+    int num_experts,
+    int topk,
+    int size_m, int size_n, int size_k,
+    int k_padded
+) {
+    const int laneId = threadIdx.x;
+    const int wrapId = threadIdx.y;
+    const int nWraps = blockDim.y;
+    const int row0 = blockIdx.x * nWraps * ROWS_PER_WARP + wrapId * ROWS_PER_WARP;
+    const int m_idx = blockIdx.y;
+
+    if (row0 >= size_n || m_idx >= size_m) {
+        return;
+    }
+
+    // 2*N rows per expert in the concat layout.
+    const int two_n = size_n << 1;
+    const size_t weight_expert_stride_bytes = (size_t)(two_n * size_k) / qk * sizeof(block_q_t);
+    const size_t input_task_stride_bytes    = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const size_t output_task_stride_elems   = (size_t)size_n;
+
+    const int token_id = sorted_token_ids[m_idx];
+    const int expert   = expert_ids[m_idx];
+    if (expert < 0 || expert >= num_experts) return;
+
+    // Gate weights = rows [0..N), up weights = rows [N..2N) within this
+    // expert slab. Both share the same expert-stride base pointer.
+    const block_q_t * __restrict__ w_expert =
+        (const block_q_t *)((const char *)gate_up_weights + (size_t)expert * weight_expert_stride_bytes);
+    // Up half starts N rows in (= N * blocks_per_row blocks).
+    const int blocks_per_row_x = size_k / qk;
+    const block_q_t * __restrict__ wu_expert = w_expert + (size_t)size_n * blocks_per_row_x;
+
+    const int input_index = token_id / topk;
+    const block_q8_1 * __restrict__ y_ptr =
+        (const block_q8_1 *)((const char *)all_inputs + (size_t)input_index * input_task_stride_bytes);
+
+    const int blocks_per_iter = vdr * WARP_SIZE / qi;
+
+    float acc_g[ROWS_PER_WARP];
+    float acc_u[ROWS_PER_WARP];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) { acc_g[r] = 0.0f; acc_u[r] = 0.0f; }
+
+    #pragma unroll
+    for (int kbx = laneId / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (laneId % (qi / vdr));
+        const block_q8_1 * y_blk = &y_ptr[kby];
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            const int row = row0 + r;
+            if (row < size_n) {
+                acc_g[r] += vec_dot_q_cuda(&w_expert[row * blocks_per_row_x + kbx],   y_blk, kqs);
+                acc_u[r] += vec_dot_q_cuda(&wu_expert[row * blocks_per_row_x + kbx], y_blk, kqs);
+            }
+        }
+    }
+
+    float * __restrict__ out_ptr =
+        all_outputs + ((size_t)token_id) * output_task_stride_elems;
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        const int row = row0 + r;
+        if (row < size_n) {
+            const float g = warp_reduce_sum(acc_g[r]);
+            const float u = warp_reduce_sum(acc_u[r]);
+            if (laneId == 0) {
+                // GELU(tanh-approx) — matches gemma4's gelu_pytorch_tanh:
+                //   0.5*g*(1 + tanh(sqrt(2/pi)*(g + 0.044715*g^3)))
+                const float g2 = g * g;
+                const float g3 = g2 * g;
+                const float k0 = 0.7978845608028654f;
+                const float k1 = 0.044715f;
+                const float gelu_g = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g3)));
+                out_ptr[row] = gelu_g * u;
+            }
+        }
+    }
+}
+
+} // namespace vllm_rs
+
+#define LAUNCH_MOE_GGUF_GATE_UP_GELU_CONCAT(qk, qi, block_q_t, vdr, vec_dot_q_cuda) \
+    const int shared_bytes_gug = 0; \
+    vllm_rs::moe_gemm_gguf_gate_up_gelu_mul_concat_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda, ROWS_PER_WARP> \
+        <<<grid_dim, block_dim, shared_bytes_gug, stream>>>( \
+        gate_up_weights, y_q8_1, \
+        sorted_token_ids, expert_ids, \
+        outputs, \
+        num_experts, topk, \
+        size_m, size_n, size_k, \
+        kx_padded \
+    );
+
+extern "C" void moe_gemm_gguf_gate_up_gelu_mul_concat(
+    const float* inputs,
+    const void* gate_up_weights,                 // [num_experts, 2*size_n, size_k]
+    const int32_t* sorted_token_ids,
+    const int32_t* expert_ids,
+    float* outputs,                              // [size_m, size_n] = gelu(gate) * up
+    int num_experts,
+    int topk,
+    int size_m,                                  // M*topk (sorted pairs count)
+    int size_n,                                  // expert ffn dim (= half of stored 2N)
+    int size_k,
+    int quant_type,
+    cudaStream_t stream
+) {
+    const int QUANTIZE_BLOCK_SIZE = CUDA_QUANTIZE_BLOCK_SIZE;
+    const int kx_padded = pad(size_k, MATRIX_ROW_PADDING);
+    const int num_blocks = ceil_div(kx_padded, QUANTIZE_BLOCK_SIZE);
+    int m_in = size_m / topk;
+    dim3 grid_dim_quant(num_blocks, m_in, 1);
+    dim3 block_dim_quant(QUANTIZE_BLOCK_SIZE, 1, 1);
+    int y_size_in_bytes = m_in * (kx_padded / QK8_1 * sizeof(block_q8_1));
+    void* y_q8_1 = nullptr;
+    cudaMallocAsync(&y_q8_1, y_size_in_bytes, stream);
+    quantize_q8_1<<<grid_dim_quant, block_dim_quant, 0, stream>>>(inputs, y_q8_1, size_k, kx_padded);
+
+    const int nWraps = 2;
+    constexpr int ROWS_PER_WARP = 1;
+    dim3 grid_dim(ceil_div(size_n, nWraps * ROWS_PER_WARP), size_m, 1);
+    dim3 block_dim(WARP_SIZE, nWraps, 1);
+
+    switch (quant_type) {
+        case 0: { LAUNCH_MOE_GGUF_GATE_UP_GELU_CONCAT(QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1); break; }
+        case 1: { LAUNCH_MOE_GGUF_GATE_UP_GELU_CONCAT(QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1); break; }
+        case 2: { LAUNCH_MOE_GGUF_GATE_UP_GELU_CONCAT(QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1); break; }
+        case 3: { LAUNCH_MOE_GGUF_GATE_UP_GELU_CONCAT(QK_K,  QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1); break; }
+        case 4: { LAUNCH_MOE_GGUF_GATE_UP_GELU_CONCAT(QK_K,  QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1); break; }
+        case 5: { LAUNCH_MOE_GGUF_GATE_UP_GELU_CONCAT(QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1); break; }
+        default: break;
+    }
+    cudaFreeAsync(y_q8_1, stream);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Dense (non-MoE) gate+up+silu*mul kernel. Same fusion pattern as the
+// MoE variant above but stripped of expert routing for batch=1 dense
+// FFN (qwen3 base, qwen2, etc.).
+//
+//   acc_g[r] = dot(gate_w[r], x_q8_1)
+//   acc_u[r] = dot(up_w[r],   x_q8_1)
+//   output[r] = silu(acc_g[r]) * acc_u[r]
+//
+// Replaces 3 launches (ffn_up matmul on [2N,K] + narrow + fused_silu_mul)
+// with 1 quantize + 1 fused matmul. Saves the [2N] intermediate write.
+// ───────────────────────────────────────────────────────────────────────
+namespace vllm_rs {
+
+template <int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ROWS_PER_WARP>
+__global__ void dense_gate_up_silu_mul_kernel(
+    const void * __restrict__ gate_w,
+    const void * __restrict__ up_w,
+    const void * __restrict__ y_q8_1,
+    float       * __restrict__ output,
+    int size_n,
+    int size_k
+) {
+    const int laneId = threadIdx.x;
+    const int wrapId = threadIdx.y;
+    const int nWraps = blockDim.y;
+    const int row0 = blockIdx.x * nWraps * ROWS_PER_WARP + wrapId * ROWS_PER_WARP;
+    if (row0 >= size_n) return;
+
+    const block_q_t  * __restrict__ wg = (const block_q_t *)gate_w;
+    const block_q_t  * __restrict__ wu = (const block_q_t *)up_w;
+    const block_q8_1 * __restrict__ yp = (const block_q8_1 *)y_q8_1;
+
+    const int blocks_per_row_x = size_k / qk;
+    const int blocks_per_iter  = vdr * WARP_SIZE / qi;
+
+    float acc_g[ROWS_PER_WARP];
+    float acc_u[ROWS_PER_WARP];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) { acc_g[r] = 0.0f; acc_u[r] = 0.0f; }
+
+    #pragma unroll
+    for (int kbx = laneId / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (laneId % (qi / vdr));
+        const block_q8_1 * y_blk = &yp[kby];
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            const int row = row0 + r;
+            if (row < size_n) {
+                acc_g[r] += vec_dot_q_cuda(&wg[row * blocks_per_row_x + kbx], y_blk, kqs);
+                acc_u[r] += vec_dot_q_cuda(&wu[row * blocks_per_row_x + kbx], y_blk, kqs);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        const int row = row0 + r;
+        if (row < size_n) {
+            const float g = warp_reduce_sum(acc_g[r]);
+            const float u = warp_reduce_sum(acc_u[r]);
+            if (laneId == 0) {
+                const float silu_g = g / (1.0f + __expf(-g));
+                output[row] = silu_g * u;
+            }
+        }
+    }
+}
+
+} // namespace vllm_rs
+
+#define LAUNCH_DENSE_GATE_UP(qk, qi, block_q_t, vdr, vec_dot_q_cuda) \
+    vllm_rs::dense_gate_up_silu_mul_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda, ROWS_PER_WARP> \
+        <<<grid_dim, block_dim, 0, stream>>>( \
+        gate_w, up_w, y_q8_1, \
+        output, size_n, size_k);
+
+extern "C" void dense_gate_up_silu_mul_v2(
+    const float* input,
+    const void* gate_w,
+    const void* up_w,
+    float* output,
+    int size_n,
+    int size_k,
+    int gguf_dtype,
+    cudaStream_t stream
+) {
+    const int QUANTIZE_BLOCK_SIZE = CUDA_QUANTIZE_BLOCK_SIZE;
+    const int kx_padded = pad(size_k, MATRIX_ROW_PADDING);
+    const int num_blocks = ceil_div(kx_padded, QUANTIZE_BLOCK_SIZE);
+    dim3 grid_dim_quant(num_blocks, 1, 1);
+    dim3 block_dim_quant(QUANTIZE_BLOCK_SIZE, 1, 1);
+    int y_size_in_bytes = (kx_padded / QK8_1) * sizeof(block_q8_1);
+    void* y_q8_1 = nullptr;
+    cudaMallocAsync(&y_q8_1, y_size_in_bytes, stream);
+    quantize_q8_1<<<grid_dim_quant, block_dim_quant, 0, stream>>>(input, y_q8_1, size_k, kx_padded);
+
+    constexpr int ROWS_PER_WARP = 1;
+    const int nWraps = 2;
+    dim3 grid_dim(ceil_div(size_n, nWraps * ROWS_PER_WARP), 1, 1);
+    dim3 block_dim(WARP_SIZE, nWraps, 1);
+
+    switch (gguf_dtype) {
+        case 0: { LAUNCH_DENSE_GATE_UP(QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1); break; }
+        case 1: { LAUNCH_DENSE_GATE_UP(QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1); break; }
+        case 2: { LAUNCH_DENSE_GATE_UP(QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1); break; }
+        case 3: { LAUNCH_DENSE_GATE_UP(QK_K,  QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1); break; }
+        case 4: { LAUNCH_DENSE_GATE_UP(QK_K,  QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1); break; }
+        case 5: { LAUNCH_DENSE_GATE_UP(QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1); break; }
+        default: break;
     }
     cudaFreeAsync(y_q8_1, stream);
 }

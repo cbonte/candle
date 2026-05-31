@@ -17,6 +17,14 @@ static void instantiate_mmq_q4_0(float * tmp_fixup,
     const int channel_ratio = args.nchannels_y / args.nchannels_x;
     const int sample_ratio  = args.nsamples_y  / args.nsamples_x;
 
+    constexpr int qk_t = ggml_cuda_type_traits<GGML_TYPE_Q4_0>::qk;
+    const uint3 blocks_per_ne00_fd = init_fastdiv_values((uint32_t)(args.ncols_x / qk_t));
+    const uint3 ntx_fd             = init_fastdiv_values((uint32_t)ntx);
+    const uint3 nchannels_y_fd     = init_fastdiv_values((uint32_t)args.nchannels_y);
+    const uint3 nsamples_y_fd      = init_fastdiv_values((uint32_t)args.nsamples_y);
+    const uint3 channel_ratio_fd   = init_fastdiv_values((uint32_t)channel_ratio);
+    const uint3 sample_ratio_fd    = init_fastdiv_values((uint32_t)sample_ratio);
+
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<GGML_TYPE_Q4_0, mmq_x, false>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<GGML_TYPE_Q4_0, mmq_x,  true>), nbytes_shared);
 
@@ -25,17 +33,17 @@ static void instantiate_mmq_q4_0(float * tmp_fixup,
         if (args.nrows_x % mmq_y == 0) {
             mul_mat_q<GGML_TYPE_Q4_0, mmq_x, false><<<grid, block_dims, nbytes_shared, stream>>>(
                 args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
-                args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-                channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-                sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                args.ncols_max);
+                blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                ntx_fd);
         } else {
             mul_mat_q<GGML_TYPE_Q4_0, mmq_x, true><<<grid, block_dims, nbytes_shared, stream>>>(
                 args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
-                args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-                channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-                sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                args.ncols_max);
+                blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                ntx_fd);
         }
         return;
     }
@@ -43,33 +51,34 @@ static void instantiate_mmq_q4_0(float * tmp_fixup,
     // Stream-k
     const dim3 grid_sk(nsm, 1, 1);
     const bool fixup_needed = ntx * nty * ntzw % nsm != 0;
-    
-    
+    const dim3 grid_sk_fixup(nsm, mmq_y/warp_size_host, 1);
+    const dim3 block_dims_fixup(warp_size_host, nwarps/2, 1);
+
     if (args.nrows_x % mmq_y == 0) {
         mul_mat_q<GGML_TYPE_Q4_0, mmq_x, false><<<grid_sk, block_dims, nbytes_shared, stream>>>(
             args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup,
-            args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-            channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-            sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-            args.ncols_max);
+            blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+            channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+            sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+            ntx_fd);
         if (fixup_needed) {
-            mul_mat_q_stream_k_fixup<GGML_TYPE_Q4_0, mmq_x, false><<<grid_sk, block_dims, 0, stream>>>(
-                args.ids_dst, args.expert_bounds, args.dst, tmp_fixup, args.ncols_x, args.nrows_x, args.ncols_dst,
-                args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
-                args.ncols_max);
+            mul_mat_q_stream_k_fixup<GGML_TYPE_Q4_0, mmq_x, false><<<grid_sk_fixup, block_dims_fixup, 0, stream>>>(
+                args.ids_dst, args.expert_bounds, args.dst, tmp_fixup, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+                args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+                ntx_fd);
         }
     } else {
         mul_mat_q<GGML_TYPE_Q4_0, mmq_x, true><<<grid_sk, block_dims, nbytes_shared, stream>>>(
             args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup,
-            args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-            channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-            sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-            args.ncols_max);
+            blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+            channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+            sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+            ntx_fd);
         if (fixup_needed) {
-            mul_mat_q_stream_k_fixup<GGML_TYPE_Q4_0, mmq_x, true><<<grid_sk, block_dims, 0, stream>>>(
-                args.ids_dst, args.expert_bounds, args.dst, tmp_fixup, args.ncols_x, args.nrows_x, args.ncols_dst,
-                args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
-                args.ncols_max);
+            mul_mat_q_stream_k_fixup<GGML_TYPE_Q4_0, mmq_x, true><<<grid_sk_fixup, block_dims_fixup, 0, stream>>>(
+                args.ids_dst, args.expert_bounds, args.dst, tmp_fixup, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+                args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+                ntx_fd);
         }
     }
 }

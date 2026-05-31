@@ -641,8 +641,20 @@ static constexpr __device__ int mmvq_rows_per_cuda_block_for(int ncols_dst) {
   return (ncols_dst == 1) ? 1 : 2;
 }
 
+// small_k variant. When ncols_x is small enough that
+// threads would otherwise be idle in the kbx loop, increase the number of
+// output rows per block from 1 to nwarps (=4 for ncols_dst <= 4). Each warp
+// contributes to a different row, keeping all threads busy.
+//
+// Caller MUST ensure nrows_x is divisible by `mmvq_rows_per_cuda_block_for_smallk`
+// to avoid OOB weight reads — the kernel does not bounds-check in the inner
+// loop (matches llama.cpp's pattern at ggml-cuda/mmvq.cu:486-505).
+static constexpr __device__ int mmvq_rows_per_cuda_block_for_smallk(int ncols_dst) {
+  return (ncols_dst == 1) ? mmvq_nwarps_for(ncols_dst) : 2;
+}
+
 template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_cuda_t vec_dot_q_cuda, int ncols_dst>
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ncols_dst, bool small_k = false>
 static __device__ void mmvq_core_impl(
     const void *__restrict__ vx,
     const block_q8_1 *__restrict__ y,
@@ -651,7 +663,11 @@ static __device__ void mmvq_core_impl(
     const int stride_col_y, const int stride_col_dst) {
 
   constexpr int nwarps = mmvq_nwarps_for(ncols_dst);
-  constexpr int rows_per_cuda_block = mmvq_rows_per_cuda_block_for(ncols_dst);
+  // small_k uses nwarps (=4) rows per block. Caller
+  // ensures nrows_x % rows_per_cuda_block == 0 to avoid inner-loop OOB.
+  constexpr int rows_per_cuda_block = small_k
+    ? mmvq_rows_per_cuda_block_for_smallk(ncols_dst)
+    : mmvq_rows_per_cuda_block_for(ncols_dst);
 
   const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
   const int row0 = rows_per_cuda_block * blockIdx.x;
@@ -710,6 +726,106 @@ static __device__ void mmvq_core_impl(
          uint32_t(row0 + threadIdx.x) < (uint32_t)nrows_x)) {
       dst[j * stride_col_dst + row0 + threadIdx.x] =
           (dst_t)tmp[j][threadIdx.x];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fused MMVQ with parallel gate matmul + SwiGLU/GLU activation.
+//
+// Mirrors llama.cpp's HAS_FUSION template path (upstream
+// ggml/src/ggml-cuda/mmvq.cu, ~line 396, added after candle's last sync).
+// Computes `up_matmul(x)` and `gate_matmul(x)` in the same kernel pass,
+// applies SwiGLU inline, and writes only the final product. For dense
+// FFN this collapses up + gate + silu_mul into one launch, saving the
+// intermediate vector R+W to VRAM.
+//
+// Q4_K weights, F32 output, ncols_dst=1 only.
+// Subsequent phases generalize to other (quant × dtype × batch) combos.
+// ---------------------------------------------------------------------------
+
+template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ncols_dst>
+static __device__ void mmvq_core_fused_silu_impl(
+    const void *__restrict__ vx,       // up_proj weights (block_q_t)
+    const void *__restrict__ vgate,    // gate_proj weights (block_q_t) — same shape as vx
+    const block_q8_1 *__restrict__ y,  // input x pre-quantized to Q8_1
+    dst_t *__restrict__ dst,           // output [ncols_x x nrows_x]
+    const int ncols_x, const int nrows_x,
+    const int stride_col_y, const int stride_col_dst) {
+
+  constexpr int nwarps = mmvq_nwarps_for(ncols_dst);
+  constexpr int rows_per_cuda_block = mmvq_rows_per_cuda_block_for(ncols_dst);
+
+  const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+  const int row0 = rows_per_cuda_block * blockIdx.x;
+  const int blocks_per_row_x = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+
+  // Parallel accumulators for up and gate.
+  float tmp_up[ncols_dst][rows_per_cuda_block]   = {{0.0f}};
+  float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+  for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    const int kqs = vdr * (tid % (qi / vdr));
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+      for (int i = 0; i < rows_per_cuda_block; ++i) {
+        const int row = row0 + i;
+        const int weight_kbx = row * blocks_per_row_x + kbx;
+        // Both matmuls read the SAME y block — input x stays in L1.
+        const block_q8_1 *y_block = &y[j * stride_col_y + kby];
+        tmp_up[j][i]   += vec_dot_q_cuda(vx,    y_block, weight_kbx, kqs);
+        tmp_gate[j][i] += vec_dot_q_cuda(vgate, y_block, weight_kbx, kqs);
+      }
+    }
+  }
+
+  __shared__ float tmp_shared_up[nwarps - 1 > 0 ? nwarps - 1 : 1]
+                                [ncols_dst][rows_per_cuda_block][WARP_SIZE];
+  __shared__ float tmp_shared_gate[nwarps - 1 > 0 ? nwarps - 1 : 1]
+                                  [ncols_dst][rows_per_cuda_block][WARP_SIZE];
+
+  if (threadIdx.y > 0) {
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+      for (int i = 0; i < rows_per_cuda_block; ++i) {
+        tmp_shared_up[threadIdx.y - 1][j][i][threadIdx.x]   = tmp_up[j][i];
+        tmp_shared_gate[threadIdx.y - 1][j][i][threadIdx.x] = tmp_gate[j][i];
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.y > 0) {
+    return;
+  }
+
+#pragma unroll
+  for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+      for (int l = 0; l < nwarps - 1; ++l) {
+        tmp_up[j][i]   += tmp_shared_up[l][j][i][threadIdx.x];
+        tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
+      }
+      tmp_up[j][i]   = warp_reduce_sum_f32(tmp_up[j][i]);
+      tmp_gate[j][i] = warp_reduce_sum_f32(tmp_gate[j][i]);
+    }
+    if (threadIdx.x < rows_per_cuda_block &&
+        (rows_per_cuda_block == 1 ||
+         uint32_t(row0 + threadIdx.x) < (uint32_t)nrows_x)) {
+      // SwiGLU: result = up * silu(gate)
+      const float up_val = tmp_up[j][threadIdx.x];
+      const float gate_val = tmp_gate[j][threadIdx.x];
+      const float silu_gate = gate_val / (1.0f + __expf(-gate_val));
+      dst[j * stride_col_dst + row0 + threadIdx.x] =
+          (dst_t)(up_val * silu_gate);
     }
   }
 }
@@ -805,6 +921,213 @@ MMVQ_PLAIN_BATCH_SET(q5_k, block_q5_K, QK_K, QI5_K, VDR_Q5_K_Q8_1_MMVQ,
                      vec_dot_q5_K_q8_1)
 MMVQ_PLAIN_BATCH_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ,
                      vec_dot_q6_K_q8_1)
+
+// ---------------------------------------------------------------------------
+// small_k variants. Decode-only (ncols_dst=1) entries
+// that pass small_k=true to mmvq_core_impl, increasing rows_per_cuda_block
+// from 1 to nwarps (=4). This amortizes block setup overhead when ncols_x
+// is small enough that the kbx loop has few iterations.
+//
+// CALLER REQUIREMENT: nrows_x must be divisible by 4 (=nwarps for ncols_dst=1).
+// Inner loop reads weight[row * blocks_per_row_x + kbx] without bounds check,
+// matching llama.cpp's pattern at ggml-cuda/mmvq.cu:486-505.
+//
+// Trigger condition (compute in Rust launcher):
+//   small_k = (ncols_x / qk) < nwarps * (vdr * WARP_SIZE / qi)
+//
+// For Q4_K: qk=256, qi=8, vdr=2 → threshold = 4 * (2 * 32 / 8) = 32 blocks
+//   → small_k=true when ncols_x < 8192 (most decode matmul inputs).
+// ---------------------------------------------------------------------------
+
+#define MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val,        \
+                                  vec_dot, dst_tag, dst_c_type)                 \
+  extern "C" __global__ void                                                    \
+      mmvq_gguf_##tag##_##dst_tag##_plain_smallk_cuda1(                         \
+          const void *__restrict__ vx, const void *__restrict__ vy,             \
+          dst_c_type *__restrict__ dst, const int ncols_x, const int nrows_x,   \
+          const int stride_col_y, const int stride_col_dst) {                   \
+    mmvq_core_impl<dst_c_type, qk_val, qi_val, block_q_t, vdr_val, vec_dot,     \
+                    1, /*small_k=*/true>(                                       \
+        vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, stride_col_y,        \
+        stride_col_dst);                                                        \
+  }
+
+#define MMVQ_PLAIN_SMALLK_BATCH_SET(tag, block_q_t, qk_val, qi_val, vdr_val,    \
+                                      vec_dot)                                  \
+  MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
+                            bf16, __nv_bfloat16)                                \
+  MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
+                            f16, half)                                          \
+  MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
+                            f32, float)
+
+MMVQ_PLAIN_SMALLK_BATCH_SET(q4_0, block_q4_0, QK4_0, QI4_0, VDR_Q4_0_Q8_1_MMVQ,
+                             vec_dot_q4_0_q8_1)
+MMVQ_PLAIN_SMALLK_BATCH_SET(q4_1, block_q4_1, QK4_1, QI4_1, VDR_Q4_1_Q8_1_MMVQ,
+                             vec_dot_q4_1_q8_1)
+MMVQ_PLAIN_SMALLK_BATCH_SET(q5_0, block_q5_0, QK5_0, QI5_0, VDR_Q5_0_Q8_1_MMVQ,
+                             vec_dot_q5_0_q8_1)
+MMVQ_PLAIN_SMALLK_BATCH_SET(q5_1, block_q5_1, QK5_1, QI5_1, VDR_Q5_1_Q8_1_MMVQ,
+                             vec_dot_q5_1_q8_1)
+MMVQ_PLAIN_SMALLK_BATCH_SET(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
+                             vec_dot_q8_0_q8_1)
+MMVQ_PLAIN_SMALLK_BATCH_SET(q2_k, block_q2_K, QK_K, QI2_K, VDR_Q2_K_Q8_1_MMVQ,
+                             vec_dot_q2_K_q8_1)
+MMVQ_PLAIN_SMALLK_BATCH_SET(q3_k, block_q3_K, QK_K, QI3_K, VDR_Q3_K_Q8_1_MMVQ,
+                             vec_dot_q3_K_q8_1)
+MMVQ_PLAIN_SMALLK_BATCH_SET(q4_k, block_q4_K, QK_K, QI4_K, VDR_Q4_K_Q8_1_MMVQ,
+                             vec_dot_q4_K_q8_1)
+MMVQ_PLAIN_SMALLK_BATCH_SET(q5_k, block_q5_K, QK_K, QI5_K, VDR_Q5_K_Q8_1_MMVQ,
+                             vec_dot_q5_K_q8_1)
+MMVQ_PLAIN_SMALLK_BATCH_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ,
+                             vec_dot_q6_K_q8_1)
+
+// ---------------------------------------------------------------------------
+// Fused MMVQ entries (Q4_K, F32 output, ncols_dst=1).
+// Engine routes here when (ffn_up + ffn_gate + silu_mul) pattern detected.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void
+mmvq_gguf_q4_k_f32_fused_silu_cuda1(
+    const void *__restrict__ vx,
+    const void *__restrict__ vgate,
+    const void *__restrict__ vy,
+    float *__restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int stride_col_y, const int stride_col_dst) {
+  mmvq_core_fused_silu_impl<float, QK_K, QI4_K, block_q4_K,
+                            VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 1>(
+      vx, vgate, (const block_q8_1 *)vy, dst,
+      ncols_x, nrows_x, stride_col_y, stride_col_dst);
+}
+
+// GELU variant of the fused (gate + up + activation) Q4_K MMVQ.
+// Uses GPT/Gemma tanh-approximation GELU: 0.5x(1+tanh(√(2/π)(x + 0.044715x³))).
+// Identical compute structure to the silu variant — only the
+// activation function on `gate_val` differs.
+//
+// Target: GELU-activated dense decode, which otherwise runs the
+// 4-launch unfused chain (gate + up + gelu_mul + down). This kernel
+// folds gate + up + gelu_mul into one launch, saving one launch per
+// layer.
+template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ncols_dst>
+static __device__ void mmvq_core_fused_gelu_impl(
+    const void *__restrict__ vx, const void *__restrict__ vgate,
+    const block_q8_1 *__restrict__ y, dst_t *__restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int stride_col_y, const int stride_col_dst) {
+  constexpr int nwarps = mmvq_nwarps_for(ncols_dst);
+  constexpr int rows_per_cuda_block = mmvq_rows_per_cuda_block_for(ncols_dst);
+
+  const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+  const int row0 = rows_per_cuda_block * blockIdx.x;
+  const int blocks_per_row_x = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+
+  float tmp_up[ncols_dst][rows_per_cuda_block]   = {{0.0f}};
+  float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+  for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    const int kqs = vdr * (tid % (qi / vdr));
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+      for (int i = 0; i < rows_per_cuda_block; ++i) {
+        const int row = row0 + i;
+        const int weight_kbx = row * blocks_per_row_x + kbx;
+        const block_q8_1 *y_block = &y[j * stride_col_y + kby];
+        tmp_up[j][i]   += vec_dot_q_cuda(vx,    y_block, weight_kbx, kqs);
+        tmp_gate[j][i] += vec_dot_q_cuda(vgate, y_block, weight_kbx, kqs);
+      }
+    }
+  }
+
+  __shared__ float tmp_shared_up[nwarps - 1 > 0 ? nwarps - 1 : 1]
+                                [ncols_dst][rows_per_cuda_block][WARP_SIZE];
+  __shared__ float tmp_shared_gate[nwarps - 1 > 0 ? nwarps - 1 : 1]
+                                  [ncols_dst][rows_per_cuda_block][WARP_SIZE];
+
+  if (threadIdx.y > 0) {
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+      for (int i = 0; i < rows_per_cuda_block; ++i) {
+        tmp_shared_up[threadIdx.y - 1][j][i][threadIdx.x]   = tmp_up[j][i];
+        tmp_shared_gate[threadIdx.y - 1][j][i][threadIdx.x] = tmp_gate[j][i];
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.y > 0) {
+    return;
+  }
+
+#pragma unroll
+  for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+      for (int l = 0; l < nwarps - 1; ++l) {
+        tmp_up[j][i]   += tmp_shared_up[l][j][i][threadIdx.x];
+        tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
+      }
+      tmp_up[j][i]   = warp_reduce_sum_f32(tmp_up[j][i]);
+      tmp_gate[j][i] = warp_reduce_sum_f32(tmp_gate[j][i]);
+    }
+    if (threadIdx.x < rows_per_cuda_block &&
+        (rows_per_cuda_block == 1 ||
+         uint32_t(row0 + threadIdx.x) < (uint32_t)nrows_x)) {
+      const float up_val = tmp_up[j][threadIdx.x];
+      const float g = tmp_gate[j][threadIdx.x];
+      // GELU tanh approximation (matches HF transformers gemma4 reference).
+      const float kAlpha = 0.7978845608028654f; // sqrt(2/π)
+      const float kBeta  = 0.044715f;
+      const float g3 = g * g * g;
+      const float gelu_gate = 0.5f * g * (1.0f + tanhf(kAlpha * (g + kBeta * g3)));
+      dst[j * stride_col_dst + row0 + threadIdx.x] =
+          (dst_t)(up_val * gelu_gate);
+    }
+  }
+}
+
+extern "C" __global__ void
+mmvq_gguf_q4_k_f32_fused_gelu_cuda1(
+    const void *__restrict__ vx,
+    const void *__restrict__ vgate,
+    const void *__restrict__ vy,
+    float *__restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int stride_col_y, const int stride_col_dst) {
+  mmvq_core_fused_gelu_impl<float, QK_K, QI4_K, block_q4_K,
+                            VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 1>(
+      vx, vgate, (const block_q8_1 *)vy, dst,
+      ncols_x, nrows_x, stride_col_y, stride_col_dst);
+}
+
+// BF16-output variant: same fused (up + gate + silu) compute as the F32
+// kernel above, but writes BF16 directly to global memory. The template
+// `dst_t` parameter handles the on-store cast inside the kernel, so the
+// downstream residual broadcast_add doesn't pay a separate F32→BF16
+// launch (which would otherwise eat the launch saving). Coupled with
+// the BF16-INPUT quantize variant
+// (launch_mmvq_gguf_quantize_q8_1_bf16) the full BF16→BF16 fused
+// (norm-ish + gate + up + silu) chain stays in BF16 end-to-end.
+extern "C" __global__ void
+mmvq_gguf_q4_k_bf16_fused_silu_cuda1(
+    const void *__restrict__ vx,
+    const void *__restrict__ vgate,
+    const void *__restrict__ vy,
+    __nv_bfloat16 *__restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int stride_col_y, const int stride_col_dst) {
+  mmvq_core_fused_silu_impl<__nv_bfloat16, QK_K, QI4_K, block_q4_K,
+                            VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 1>(
+      vx, vgate, (const block_q8_1 *)vy, dst,
+      ncols_x, nrows_x, stride_col_y, stride_col_dst);
+}
 
 // Padding-aware BF16/F16/F32 -> Q8_1 quantize kernels.
 
@@ -1006,6 +1329,114 @@ MMVQ_LAUNCHER_PLAIN(q3_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(q4_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(q5_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(q6_k, f32, float)
+
+// small_k launchers. Decode-only (b_size=1, ncols_dst=1).
+// rows_per_block = 4 (= nwarps). Caller MUST ensure nrows_x % 4 == 0.
+#define MMVQ_LAUNCHER_SMALLK_PLAIN(tag, dst_tag, dst_c_type)                   \
+  extern "C" void launch_mmvq_gguf_##tag##_##dst_tag##_plain_smallk(           \
+      const void *vx, const void *vy, void *dst, int ncols_x, int nrows_x,    \
+      int stride_col_y, int stride_col_dst, void *stream) {                    \
+    const unsigned int rows_per_block = 4;                                     \
+    const unsigned int nblocks =                                               \
+        (unsigned int)(nrows_x / rows_per_block);                              \
+    const unsigned int nwarps = 4;                                             \
+    dim3 grid(nblocks, 1, 1);                                                  \
+    dim3 block(WARP_SIZE, nwarps, 1);                                          \
+    cudaStream_t s = static_cast<cudaStream_t>(stream);                        \
+    mmvq_gguf_##tag##_##dst_tag##_plain_smallk_cuda1<<<grid, block, 0, s>>>(   \
+        vx, vy, (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y,             \
+        stride_col_dst);                                                       \
+  }
+
+MMVQ_LAUNCHER_SMALLK_PLAIN(q4_0, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q4_1, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q5_0, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q5_1, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q8_0, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q2_k, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q3_k, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q4_k, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q5_k, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q6_k, bf16, __nv_bfloat16)
+
+MMVQ_LAUNCHER_SMALLK_PLAIN(q4_0, f16, half)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q4_1, f16, half)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q5_0, f16, half)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q5_1, f16, half)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q8_0, f16, half)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q2_k, f16, half)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q3_k, f16, half)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q4_k, f16, half)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q5_k, f16, half)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q6_k, f16, half)
+
+MMVQ_LAUNCHER_SMALLK_PLAIN(q4_0, f32, float)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q4_1, f32, float)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q5_0, f32, float)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q5_1, f32, float)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q8_0, f32, float)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q2_k, f32, float)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q3_k, f32, float)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q4_k, f32, float)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q5_k, f32, float)
+MMVQ_LAUNCHER_SMALLK_PLAIN(q6_k, f32, float)
+
+// Fused (up + gate + SwiGLU) launcher (Q4_K, F32, ncols=1).
+// Identical grid/block geometry to the plain ncols=1 launcher; only
+// the kernel + arg list differ (extra `vgate` weight pointer).
+extern "C" void launch_mmvq_gguf_q4_k_f32_fused_silu(
+    const void *vx, const void *vgate, const void *vy, void *dst,
+    int ncols_x, int nrows_x, int stride_col_y, int stride_col_dst,
+    void *stream) {
+  // ncols_dst = 1 → rows_per_block = 1, nwarps = 4 (matches plain path).
+  const unsigned int rows_per_block = 1;
+  const unsigned int nblocks =
+      (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);
+  const unsigned int nwarps = 4;
+  dim3 grid(nblocks, 1, 1);
+  dim3 block(WARP_SIZE, nwarps, 1);
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  mmvq_gguf_q4_k_f32_fused_silu_cuda1<<<grid, block, 0, s>>>(
+      vx, vgate, vy, (float *)dst, ncols_x, nrows_x, stride_col_y,
+      stride_col_dst);
+}
+
+// GELU sibling — same compute structure as fused_silu, only the
+// activation in the kernel inner differs. For gemma4 dense decode.
+extern "C" void launch_mmvq_gguf_q4_k_f32_fused_gelu(
+    const void *vx, const void *vgate, const void *vy, void *dst,
+    int ncols_x, int nrows_x, int stride_col_y, int stride_col_dst,
+    void *stream) {
+  const unsigned int rows_per_block = 1;
+  const unsigned int nblocks =
+      (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);
+  const unsigned int nwarps = 4;
+  dim3 grid(nblocks, 1, 1);
+  dim3 block(WARP_SIZE, nwarps, 1);
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  mmvq_gguf_q4_k_f32_fused_gelu_cuda1<<<grid, block, 0, s>>>(
+      vx, vgate, vy, (float *)dst, ncols_x, nrows_x, stride_col_y,
+      stride_col_dst);
+}
+
+// BF16-output sibling. Lets BF16 LLMs keep the entire fused (gate + up
+// + silu) chain in BF16 end-to-end, removing the F32→BF16 cast that the
+// downstream residual broadcast_add would otherwise need.
+extern "C" void launch_mmvq_gguf_q4_k_bf16_fused_silu(
+    const void *vx, const void *vgate, const void *vy, void *dst,
+    int ncols_x, int nrows_x, int stride_col_y, int stride_col_dst,
+    void *stream) {
+  const unsigned int rows_per_block = 1;
+  const unsigned int nblocks =
+      (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);
+  const unsigned int nwarps = 4;
+  dim3 grid(nblocks, 1, 1);
+  dim3 block(WARP_SIZE, nwarps, 1);
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  mmvq_gguf_q4_k_bf16_fused_silu_cuda1<<<grid, block, 0, s>>>(
+      vx, vgate, vy, (__nv_bfloat16 *)dst, ncols_x, nrows_x, stride_col_y,
+      stride_col_dst);
+}
 
 // Quantize launchers.
 

@@ -406,6 +406,37 @@ static __device__ __forceinline__ int warp_reduce_max(int x) {
     } while(0)
 
 // ============================================================
+// Fast unsigned division using precomputed magic numbers.
+// Ported from llama.cpp ggml-cuda/common.cuh; see Granlund-Möller (PLDI'94).
+// init_fastdiv_values returns <mp, L, divisor> packed in uint3.
+// Then n/d = fastdiv(n, fdv) = (mulhi(n, mp) + n) >> L.
+// ============================================================
+static inline uint3 init_fastdiv_values(uint32_t d) {
+    // compute L = ceil(log2(d));
+    uint32_t L = 0;
+    while (L < 32 && ((uint32_t)1 << L) < d) {
+        L++;
+    }
+    uint32_t mp = (uint32_t) ((((uint64_t)1) << 32) * ((((uint64_t)1) << L) - d) / d + 1);
+    return make_uint3(mp, L, d);
+}
+
+static __device__ __forceinline__ uint32_t fastdiv(uint32_t n, const uint3 fdv) {
+    const uint32_t hi = __umulhi(n, fdv.x);
+    return (hi + n) >> fdv.y;
+}
+
+static __device__ __forceinline__ uint32_t fastmodulo(uint32_t n, const uint3 fdv) {
+    return n - fastdiv(n, fdv) * fdv.z;
+}
+
+static __device__ __forceinline__ uint2 fast_div_modulo(uint32_t n, const uint3 fdv) {
+    const uint32_t q = fastdiv(n, fdv);
+    const uint32_t m = n - q * fdv.z;
+    return make_uint2(q, m);
+}
+
+// ============================================================
 // ggml_cuda_type_traits
 // ============================================================
 

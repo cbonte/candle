@@ -2632,7 +2632,19 @@ static __device__ void mul_mat_vec_q(
     constexpr int nwarps              = 1;
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int nwarps              = ncols_y <= 4 ? 4 : 2;
+    // K-quants have qk=256 → blocks_per_row_x is small (8 for K=2048),
+    // so most threads in a 4-warp block are idle anyway. Reducing to
+    // 2 warps cuts wasted threads in half while doubling block count
+    // (better SM occupancy on Blackwell). Confirmed nwarps=4 is ~17%
+    // slower on RTX 5070 Ti for K-quants.
+    //
+    // qk=32 (Q4_0/Q5_0/Q8_0/Q4_1/Q5_1): 64 blocks per row — 4 warps
+    // fully occupy AND parallelize more dot products per block.
+    // Matches llama.cpp mmvq.cu:303 calc_nwarps (GENERIC table,
+    // ncols_dst=1 → 4 warps). This is the load-bearing path for
+    // Q4_0-weighted decode (e.g. phi2-family models).
+    constexpr int nwarps              = (qk == 32 && ncols_y == 1) ? 8
+                                       : (ncols_y <= 4 ? 2 : 2);
     constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
@@ -3369,7 +3381,8 @@ extern "C" __global__ void quantize_q8_1(const float * __restrict__ x, void * __
     sum = warp_reduce_sum(sum);
 
     const float d = amax / 127;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const float id = amax == 0.0f ? 0.0f : 1.0f / d;
+    const int8_t q = roundf(xi * id);
 
     y[ib].qs[iqs] = q;
 
@@ -3379,6 +3392,2451 @@ extern "C" __global__ void quantize_q8_1(const float * __restrict__ x, void * __
 
     reinterpret_cast<half&>(y[ib].ds.x) = d;
     reinterpret_cast<half&>(y[ib].ds.y) = sum;
+}
+
+// GPU-native Q8_0 quantizer. Same block layout as llama.cpp's
+// quantize_row_q8_0_ref: 32 int8 quants + 1 half scale per block. Used for
+// persistent KV-cache storage where we want the cheap Q8_0 × Q8_1 gemv
+// kernels to run against the cache without a CPU roundtrip on every write.
+extern "C" __global__ void quantize_q8_0(const float * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
+    const int ix = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (ix >= kx_padded) {
+        return;
+    }
+
+    const int iy = blockDim.y*blockIdx.y + threadIdx.y;
+
+    const int i_padded = iy*kx_padded + ix;
+
+    block_q8_0 * y = (block_q8_0 *) vy;
+
+    const int ib = i_padded / QK8_0; // block index
+    const int iqs = i_padded % QK8_0; // quant index
+
+    const float xi = ix < kx ? x[iy*kx + ix] : 0.0f;
+    float amax = fabsf(xi);
+
+    amax = warp_reduce_max(amax);
+
+    const float d = amax / 127;
+    const float id = amax == 0.0f ? 0.0f : 1.0f / d;
+    const int8_t q = roundf(xi * id);
+
+    y[ib].qs[iqs] = q;
+
+    if (iqs == 0) {
+        y[ib].d = d;
+    }
+}
+
+// Device-position variant of quantize_q8_0. Reads the destination token
+// slot index from `slot_dev[0]` and writes the quantized blocks at
+// `dst[slot_dev[0] * num_blocks_per_token * sizeof(block_q8_0)]`.
+//
+// Required for CUDA graph capture of the Q8 KV append step. The
+// non-dev_pos kernel writes at a host-supplied dst pointer that's
+// baked into the captured kernel parameters at capture time — every
+// replay overwrites the same slot, so the captured graph is unusable
+// past the first replay.
+//
+// Designed for the single-token-per-launch decode pattern (kx is one
+// token's K or V row, ky=1 implied). For the engine's KV append
+// the row width n_kv_heads × head_dim must be a multiple of
+// MATRIX_ROW_PADDING (512) — same guard as quantize_q8_0_f32_into_offset
+// in cuda.rs. Caller falls back to the staged path for non-aligned
+// shapes.
+extern "C" __global__ void quantize_q8_0_dev_slot(
+    const float * __restrict__ x,
+    void * __restrict__ vy,
+    const int32_t * __restrict__ slot_dev,
+    const int kx,
+    const int kx_padded,
+    const int num_blocks_per_token
+) {
+    const int ix = blockDim.x * blockIdx.x + threadIdx.x;
+    if (ix >= kx_padded) {
+        return;
+    }
+    const int iy = blockDim.y * blockIdx.y + threadIdx.y;
+    const int i_padded = iy * kx_padded + ix;
+
+    // Resolve the per-token destination offset at REPLAY time.
+    const int slot = slot_dev[0];
+    block_q8_0 * y = (block_q8_0 *) vy + (size_t)slot * (size_t)num_blocks_per_token;
+
+    const int ib  = i_padded / QK8_0;
+    const int iqs = i_padded % QK8_0;
+
+    const float xi = ix < kx ? x[iy * kx + ix] : 0.0f;
+    float amax = fabsf(xi);
+
+    amax = warp_reduce_max(amax);
+
+    const float d  = amax / 127;
+    const float id = amax == 0.0f ? 0.0f : 1.0f / d;
+    const int8_t q = roundf(xi * id);
+
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        y[ib].d = d;
+    }
+}
+
+// Paired K+V quantize at host-given byte offset. Equivalent to two back-to-back
+// `quantize_q8_0_f32_into_offset` calls but launched as one kernel — saves 1
+// launch per layer.
+//
+// gridDim.z selects which side runs (0 = K, 1 = V); within a side the kernel
+// is identical to the single-side `quantize_q8_0` above. Source layout is one
+// row of `kx` F32 elements (single-token decode); destination is the same
+// `dst_byte_offset` in both K and V buffers (callers must guarantee both
+// buffers are equally sized).
+extern "C" __global__ void quantize_q8_0_kv_paired(
+    const float * __restrict__ xk,
+    const float * __restrict__ xv,
+    void  * __restrict__ vyk,
+    void  * __restrict__ vyv,
+    const int kx,
+    const int kx_padded,
+    const int dst_byte_offset
+) {
+    const int ix = blockDim.x * blockIdx.x + threadIdx.x;
+    if (ix >= kx_padded) return;
+    const int iy = blockDim.y * blockIdx.y + threadIdx.y;
+    const int i_padded = iy * kx_padded + ix;
+
+    const float * x   = (blockIdx.z == 0) ? xk  : xv;
+    char        * vy0 = (blockIdx.z == 0) ? (char*)vyk : (char*)vyv;
+    block_q8_0  * y   = (block_q8_0 *)(vy0 + dst_byte_offset);
+
+    const int ib  = i_padded / QK8_0;
+    const int iqs = i_padded % QK8_0;
+
+    const float xi = ix < kx ? x[iy * kx + ix] : 0.0f;
+    float amax = fabsf(xi);
+    amax = warp_reduce_max(amax);
+
+    const float d  = amax / 127;
+    const float id = amax == 0.0f ? 0.0f : 1.0f / d;
+    const int8_t q = roundf(xi * id);
+
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        y[ib].d = d;
+    }
+}
+
+// GPU-native Q4_0 quantizer. Block layout: 1 half scale + 16 bytes qs (two
+// 4-bit nibbles per byte), 32 input elements per block. Follows llama.cpp's
+// quantize_row_q4_0_ref: the scale is signed ("max / -8") so the dequantize
+// step `(nibble - 8) * d` recovers the original sign; the +8 bias lets the
+// stored value fit in an unsigned nibble.
+extern "C" __global__ void quantize_q4_0(const float * __restrict__ x, void * __restrict__ vy,
+                                         const int kx, const int kx_padded) {
+    const int ix = blockDim.x * blockIdx.x + threadIdx.x;
+    if (ix >= kx_padded) return;
+
+    const int iy = blockDim.y * blockIdx.y + threadIdx.y;
+    const int i_padded = iy * kx_padded + ix;
+
+    block_q4_0 * y = (block_q4_0 *) vy;
+    const int ib = i_padded / QK4_0;
+    const int iqs = i_padded % QK4_0;
+
+    const float xi = ix < kx ? x[iy * kx + ix] : 0.0f;
+
+    // Warp reduction: find the signed value whose absolute magnitude is
+    // largest across the 32 lanes of this block. We can't just take the
+    // signed max — the scale must key off the most-extreme magnitude.
+    float amax = fabsf(xi);
+    float mval = xi;
+    for (int off = 16; off > 0; off /= 2) {
+        float a2 = __shfl_xor_sync(0xffffffff, amax, off);
+        float v2 = __shfl_xor_sync(0xffffffff, mval, off);
+        if (a2 > amax) { amax = a2; mval = v2; }
+    }
+
+    const float d  = mval / -8.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+    // +8 bias → unsigned nibble in [0, 15]. Clamp matches llama.cpp's ref.
+    int q_int = (int)(xi * id + 8.5f);
+    q_int = q_int < 0 ? 0 : (q_int > 15 ? 15 : q_int);
+
+    // Pack: lane j in [0, 16) stores qs[j] with low nibble from x[j] and
+    // high nibble from x[j + 16]; we pull the high value via warp shuffle.
+    //
+    // All 32 lanes must participate in __shfl_down_sync with the same mask
+    // — conditioning the shuffle on `iqs < 16` is undefined behaviour and
+    // empirically zeroed every high nibble (positions 16..31 of each block
+    // all dequantised to the block's max). Do the shuffle unconditionally,
+    // then guard only the write.
+    int q_high = __shfl_down_sync(0xffffffff, q_int, 16);
+    if (iqs < 16) {
+        y[ib].qs[iqs] = (uint8_t)((q_int & 0xF) | ((q_high & 0xF) << 4));
+    }
+
+    if (iqs == 0) {
+        y[ib].d = __float2half(d);
+    }
+}
+
+extern "C" __global__ void quantize_q4_0_f16(const half * __restrict__ x, void * __restrict__ vy,
+                                              const int kx, const int kx_padded) {
+    const int ix = blockDim.x * blockIdx.x + threadIdx.x;
+    if (ix >= kx_padded) return;
+
+    const int iy = blockDim.y * blockIdx.y + threadIdx.y;
+    const int i_padded = iy * kx_padded + ix;
+
+    block_q4_0 * y = (block_q4_0 *) vy;
+    const int ib = i_padded / QK4_0;
+    const int iqs = i_padded % QK4_0;
+
+    const float xi = ix < kx ? __half2float(x[iy * kx + ix]) : 0.0f;
+
+    float amax = fabsf(xi);
+    float mval = xi;
+    for (int off = 16; off > 0; off /= 2) {
+        float a2 = __shfl_xor_sync(0xffffffff, amax, off);
+        float v2 = __shfl_xor_sync(0xffffffff, mval, off);
+        if (a2 > amax) { amax = a2; mval = v2; }
+    }
+
+    const float d  = mval / -8.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    int q_int = (int)(xi * id + 8.5f);
+    q_int = q_int < 0 ? 0 : (q_int > 15 ? 15 : q_int);
+
+    // See f32 variant for why the shuffle must be outside the write guard.
+    int q_high = __shfl_down_sync(0xffffffff, q_int, 16);
+    if (iqs < 16) {
+        y[ib].qs[iqs] = (uint8_t)((q_int & 0xF) | ((q_high & 0xF) << 4));
+    }
+
+    if (iqs == 0) {
+        y[ib].d = __float2half(d);
+    }
+}
+
+// Small-k attention-score gemv: Q (q8_1) × K^T (q8_0) where K is per-token
+// row-major so its "n" axis is the sequence length (potentially huge) and
+// its "k" axis is head_dim (small, 64/128/256). Candle's existing
+// mul_mat_vec_q*_q8_1 kernels are tuned for large-k LLM weights and
+// underperform on this shape by 5-7× at long contexts. This kernel
+// parallelises across the large n axis and uses all 32 warp lanes for the
+// small dot product.
+//
+// Launch geometry: blockDim = (32, WARPS_PER_BLOCK), one warp per output
+// row. gridDim = (ceil(n_kv / WARPS_PER_BLOCK), b_size, 1).
+//
+// Layout assumptions:
+//   K: block_q8_0[n_kv][HEAD_DIM/32]   (per-token row of quantized blocks)
+//   Q: block_q8_1[b_size][HEAD_DIM/32] (same)
+//   dst: float[b_size][n_kv]
+template <int HEAD_DIM>
+static __device__ __forceinline__ float attn_score_row_q8_0_q8_1(
+    const block_q8_0 * __restrict__ K_row,
+    const block_q8_1 * __restrict__ Q_row,
+    int lane
+) {
+    static_assert(HEAD_DIM % 32 == 0, "HEAD_DIM must be multiple of 32");
+    constexpr int HD_BLOCKS = HEAD_DIM / 32;
+
+    if constexpr (HD_BLOCKS == 4) {
+        // head_dim=128: 4 blocks × 8 int32 = 32 lanes exactly, no waste.
+        const int bi  = lane >> 3;   // 0..3
+        const int iqs = lane & 7;    // 0..7
+        int kv = get_int_from_int8(K_row[bi].qs, iqs);
+        int qv = get_int_from_int8_aligned(Q_row[bi].qs, iqs);
+        int sumi = __dp4a(kv, qv, 0);
+        // reduce within block (8 lanes)
+        sumi += __shfl_xor_sync(0xffffffff, sumi, 4);
+        sumi += __shfl_xor_sync(0xffffffff, sumi, 2);
+        sumi += __shfl_xor_sync(0xffffffff, sumi, 1);
+        // scale at block head (iqs == 0)
+        float contrib = 0.0f;
+        if (iqs == 0) {
+            float d_k = __half2float(K_row[bi].d);
+            float d_q = __half2float(__low2half(Q_row[bi].ds));
+            contrib = sumi * d_k * d_q;
+        }
+        // reduce across the 4 block heads (lanes 0, 8, 16, 24)
+        contrib += __shfl_xor_sync(0xffffffff, contrib, 16);
+        contrib += __shfl_xor_sync(0xffffffff, contrib, 8);
+        return contrib;
+    } else if constexpr (HD_BLOCKS == 2) {
+        // head_dim=64: 2 blocks × 8 int32 = 16 lanes active, upper half idle.
+        const int bi  = lane >> 3;
+        const int iqs = lane & 7;
+        int sumi = 0;
+        if (lane < 16) {
+            int kv = get_int_from_int8(K_row[bi].qs, iqs);
+            int qv = get_int_from_int8_aligned(Q_row[bi].qs, iqs);
+            sumi = __dp4a(kv, qv, 0);
+        }
+        sumi += __shfl_xor_sync(0xffffffff, sumi, 4);
+        sumi += __shfl_xor_sync(0xffffffff, sumi, 2);
+        sumi += __shfl_xor_sync(0xffffffff, sumi, 1);
+        float contrib = 0.0f;
+        if (lane < 16 && iqs == 0) {
+            float d_k = __half2float(K_row[bi].d);
+            float d_q = __half2float(__low2half(Q_row[bi].ds));
+            contrib = sumi * d_k * d_q;
+        }
+        contrib += __shfl_xor_sync(0xffffffff, contrib, 8);
+        return contrib;
+    } else {
+        // Generic (head_dim=256, 512, ...): iterate blocks, 8 lanes per block.
+        float total = 0.0f;
+        #pragma unroll
+        for (int bi = 0; bi < HD_BLOCKS; ++bi) {
+            int sumi = 0;
+            if (lane < 8) {
+                int kv = get_int_from_int8(K_row[bi].qs, lane);
+                int qv = get_int_from_int8_aligned(Q_row[bi].qs, lane);
+                sumi = __dp4a(kv, qv, 0);
+            }
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 4);
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 2);
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 1);
+            if (lane == 0) {
+                float d_k = __half2float(K_row[bi].d);
+                float d_q = __half2float(__low2half(Q_row[bi].ds));
+                total += sumi * d_k * d_q;
+            }
+        }
+        return total;
+    }
+}
+
+// Multi-batch-per-warp variant: each warp computes dot(Q[b], K[n]) for
+// all b in [0, b_size) on the same n, so K[n] is loaded once and reused
+// across the batch loop. This is the decisive optimisation for GQA where
+// n_q (=n_head/n_kv) is 4-8 and K bandwidth dominates at long contexts.
+#define ATTN_SCORE_KERNEL(NAME, HD)                                          \
+extern "C" __global__ void NAME(                                             \
+    const void * __restrict__ K_blob,                                        \
+    const void * __restrict__ Q_blob,                                        \
+    float * __restrict__ dst,                                                \
+    int n_kv,                                                                \
+    int n_kv_stride_blocks,                                                  \
+    int b_stride_blocks,                                                     \
+    int b_size                                                               \
+) {                                                                          \
+    constexpr int HD_BLOCKS = HD / 32;                                       \
+    const int lane    = threadIdx.x;                                         \
+    const int warp_id = threadIdx.y;                                         \
+    const int n = blockIdx.x * blockDim.y + warp_id;                         \
+    if (n >= n_kv) return;                                                   \
+    const block_q8_0 * K_row =                                               \
+        reinterpret_cast<const block_q8_0 *>(K_blob) + n * n_kv_stride_blocks;\
+    const block_q8_1 * Q_blob_p = reinterpret_cast<const block_q8_1 *>(Q_blob); \
+    /* HD=128 fast path: load K once per warp into registers. */             \
+    if constexpr (HD == 128) {                                               \
+        const int bi  = lane >> 3;                                           \
+        const int iqs = lane & 7;                                            \
+        const int k_val = get_int_from_int8(K_row[bi].qs, iqs);              \
+        const float k_scale = __half2float(K_row[bi].d);                     \
+        for (int b = 0; b < b_size; ++b) {                                   \
+            const block_q8_1 * Q_row = Q_blob_p + b * b_stride_blocks;       \
+            const int q_val = get_int_from_int8_aligned(Q_row[bi].qs, iqs);  \
+            int sumi = __dp4a(k_val, q_val, 0);                              \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 4);                    \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 2);                    \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 1);                    \
+            float contrib = 0.0f;                                            \
+            if (iqs == 0) {                                                  \
+                const float q_scale = __half2float(__low2half(Q_row[bi].ds));\
+                contrib = sumi * k_scale * q_scale;                          \
+            }                                                                \
+            contrib += __shfl_xor_sync(0xffffffff, contrib, 16);             \
+            contrib += __shfl_xor_sync(0xffffffff, contrib, 8);              \
+            if (lane == 0) dst[b * n_kv + n] = contrib;                      \
+        }                                                                    \
+        return;                                                              \
+    }                                                                        \
+    /* HD=64 fast path: 2 blocks × 8 lanes = 16 active lanes, K in regs. */  \
+    if constexpr (HD == 64) {                                                \
+        const int bi  = lane >> 3;  /* 0..3 but only bi<2 is used */         \
+        const int iqs = lane & 7;                                            \
+        const bool active = (lane < 16);                                     \
+        int k_val = 0;                                                       \
+        float k_scale = 0.0f;                                                \
+        if (active) {                                                        \
+            k_val = get_int_from_int8(K_row[bi].qs, iqs);                    \
+            k_scale = __half2float(K_row[bi].d);                             \
+        }                                                                    \
+        for (int b = 0; b < b_size; ++b) {                                   \
+            const block_q8_1 * Q_row = Q_blob_p + b * b_stride_blocks;       \
+            int sumi = 0;                                                    \
+            if (active) {                                                    \
+                const int q_val = get_int_from_int8_aligned(Q_row[bi].qs, iqs);\
+                sumi = __dp4a(k_val, q_val, 0);                              \
+            }                                                                \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 4);                    \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 2);                    \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 1);                    \
+            float contrib = 0.0f;                                            \
+            if (active && iqs == 0) {                                        \
+                const float q_scale = __half2float(__low2half(Q_row[bi].ds));\
+                contrib = sumi * k_scale * q_scale;                          \
+            }                                                                \
+            contrib += __shfl_xor_sync(0xffffffff, contrib, 8);              \
+            if (lane == 0) dst[b * n_kv + n] = contrib;                      \
+        }                                                                    \
+        return;                                                              \
+    }                                                                        \
+    /* Generic fallback: reuse single-batch helper in a loop. */             \
+    for (int b = 0; b < b_size; ++b) {                                       \
+        const block_q8_1 * Q_row = Q_blob_p + b * b_stride_blocks;           \
+        float total = attn_score_row_q8_0_q8_1<HD>(K_row, Q_row, lane);      \
+        if (lane == 0) dst[b * n_kv + n] = total;                            \
+    }                                                                        \
+}
+
+ATTN_SCORE_KERNEL(attn_score_q8_0_q8_1_hd64,  64)
+ATTN_SCORE_KERNEL(attn_score_q8_0_q8_1_hd128, 128)
+ATTN_SCORE_KERNEL(attn_score_q8_0_q8_1_hd256, 256)
+// Gemma4 Global layers use HD=512. The generic fallback at the end of
+// the macro handles arbitrary HD that's a multiple of 32.
+ATTN_SCORE_KERNEL(attn_score_q8_0_q8_1_hd512, 512)
+
+// GQA variant: processes all kv-heads in a single launch (gridDim.y =
+// n_kv_heads). Each block picks its kv-head from blockIdx.y and computes
+// dot(Q[kv*n_q_per_kv + qh], K[n, kv]) for qh in [0, n_q_per_kv).
+// Payoff: eliminates n_kv_heads-1 kernel-launch latencies per decode
+// step — for GQA 8:1 with 8 kv-heads × ~10µs launch overhead each,
+// that's ~70µs saved per attention forward.
+#define ATTN_SCORE_GQA_KERNEL(NAME, HD)                                      \
+extern "C" __global__ void NAME(                                             \
+    const void * __restrict__ K_blob,                                        \
+    const void * __restrict__ Q_blob,                                        \
+    float * __restrict__ dst,                                                \
+    int n_kv,                                                                \
+    int n_kv_stride_blocks,      /* full token stride = n_kv_heads*HD/32 */  \
+    int kv_head_stride_blocks,   /* per-kv-head stride within token = HD/32*/\
+    int q_stride_blocks,         /* per-query-row stride in Q (padded) */    \
+    int n_q_per_kv,                                                          \
+    float scale                  /* pre-softmax scale (1/sqrt(head_dim)) */  \
+) {                                                                          \
+    const int kv = blockIdx.y;                                               \
+    const int lane    = threadIdx.x;                                         \
+    const int warp_id = threadIdx.y;                                         \
+    const int n = blockIdx.x * blockDim.y + warp_id;                         \
+    if (n >= n_kv) return;                                                   \
+    const block_q8_0 * K_row =                                               \
+        reinterpret_cast<const block_q8_0 *>(K_blob)                         \
+        + n * n_kv_stride_blocks                                             \
+        + kv * kv_head_stride_blocks;                                        \
+    const block_q8_1 * Q_base =                                              \
+        reinterpret_cast<const block_q8_1 *>(Q_blob)                         \
+        + kv * n_q_per_kv * q_stride_blocks;                                 \
+    if constexpr (HD == 128) {                                               \
+        const int bi  = lane >> 3;                                           \
+        const int iqs = lane & 7;                                            \
+        const int k_val = get_int_from_int8(K_row[bi].qs, iqs);              \
+        const float k_scale = __half2float(K_row[bi].d);                     \
+        for (int qh = 0; qh < n_q_per_kv; ++qh) {                            \
+            const block_q8_1 * Q_row = Q_base + qh * q_stride_blocks;        \
+            const int q_val = get_int_from_int8_aligned(Q_row[bi].qs, iqs);  \
+            int sumi = __dp4a(k_val, q_val, 0);                              \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 4);                    \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 2);                    \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 1);                    \
+            float contrib = 0.0f;                                            \
+            if (iqs == 0) {                                                  \
+                const float q_scale = __half2float(__low2half(Q_row[bi].ds));\
+                contrib = sumi * k_scale * q_scale;                          \
+            }                                                                \
+            contrib += __shfl_xor_sync(0xffffffff, contrib, 16);             \
+            contrib += __shfl_xor_sync(0xffffffff, contrib, 8);              \
+            if (lane == 0) {                                                 \
+                const int q_row = kv * n_q_per_kv + qh;                      \
+                dst[q_row * n_kv + n] = contrib * scale;                     \
+            }                                                                \
+        }                                                                    \
+        return;                                                              \
+    }                                                                        \
+    if constexpr (HD == 64) {                                                \
+        const int bi  = lane >> 3;                                           \
+        const int iqs = lane & 7;                                            \
+        const bool active = (lane < 16);                                     \
+        int k_val = 0;                                                       \
+        float k_scale = 0.0f;                                                \
+        if (active) {                                                        \
+            k_val = get_int_from_int8(K_row[bi].qs, iqs);                    \
+            k_scale = __half2float(K_row[bi].d);                             \
+        }                                                                    \
+        for (int qh = 0; qh < n_q_per_kv; ++qh) {                            \
+            const block_q8_1 * Q_row = Q_base + qh * q_stride_blocks;        \
+            int sumi = 0;                                                    \
+            if (active) {                                                    \
+                const int q_val = get_int_from_int8_aligned(Q_row[bi].qs, iqs);\
+                sumi = __dp4a(k_val, q_val, 0);                              \
+            }                                                                \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 4);                    \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 2);                    \
+            sumi += __shfl_xor_sync(0xffffffff, sumi, 1);                    \
+            float contrib = 0.0f;                                            \
+            if (active && iqs == 0) {                                        \
+                const float q_scale = __half2float(__low2half(Q_row[bi].ds));\
+                contrib = sumi * k_scale * q_scale;                          \
+            }                                                                \
+            contrib += __shfl_xor_sync(0xffffffff, contrib, 8);              \
+            if (lane == 0) {                                                 \
+                const int q_row = kv * n_q_per_kv + qh;                      \
+                dst[q_row * n_kv + n] = contrib * scale;                     \
+            }                                                                \
+        }                                                                    \
+        return;                                                              \
+    }                                                                        \
+    /* Generic fallback for HD=256 etc.: iterate blocks, 8 lanes per block */\
+    for (int qh = 0; qh < n_q_per_kv; ++qh) {                                \
+        const block_q8_1 * Q_row = Q_base + qh * q_stride_blocks;            \
+        float total = attn_score_row_q8_0_q8_1<HD>(K_row, Q_row, lane);      \
+        if (lane == 0) {                                                     \
+            const int q_row = kv * n_q_per_kv + qh;                          \
+            dst[q_row * n_kv + n] = total * scale;                           \
+        }                                                                    \
+    }                                                                        \
+}
+
+ATTN_SCORE_GQA_KERNEL(attn_score_q8_0_q8_1_gqa_hd64,  64)
+ATTN_SCORE_GQA_KERNEL(attn_score_q8_0_q8_1_gqa_hd128, 128)
+ATTN_SCORE_GQA_KERNEL(attn_score_q8_0_q8_1_gqa_hd256, 256)
+// Gemma4 Global layers use HD=512 → falls into the generic loop at the
+// end of the macro.
+ATTN_SCORE_GQA_KERNEL(attn_score_q8_0_q8_1_gqa_hd512, 512)
+
+// ─── Q4_0 K-path attention score (KIVI layout) ────────────────────────────
+//
+// Layout differs fundamentally from the Q8 K path above. In KIVI Q4 K, each
+// block holds 32 consecutive **seq** positions of ONE (head, channel);
+// storage is `[seq_block, n_kv, head_dim]` with 18-byte cells. This
+// transpose means the seq-axis reduction the Q8 kernel does can't apply —
+// instead, one kernel block covers 32 consecutive seq positions (ONE cache
+// block row for one head) and sums contributions across `head_dim`
+// channels.
+//
+// Grid:  (seq_blocks, n_q_heads, 1)
+// Block: (32 lanes × N_WARPS warps)
+//   - lane `l` owns output score[q_head, sb*32 + l].
+//   - warp `w` handles channels {w, w+N_WARPS, w+2*N_WARPS, ...}.
+//   - partial accumulators live in registers, reduced across warps via shmem.
+//
+// Input Q is F32 `[n_q_heads, head_dim]`. We don't need Q8_1 because Q4's
+// per-block scale is already a single half, and the dot product reduces to
+// `sum over c of Q[c] * (nibble-8) * d_c`. DP4A would require quantising Q
+// per-block too; worthwhile later, but the simple path here is correct.
+//
+// The residual F16 partial block (positions
+// `[full_seq, current_seq_len)`) is handled outside this kernel — the host
+// path computes those scores with a small f16 matmul and concatenates.
+#define ATTN_SCORE_Q4_WARPS 16
+
+// Inside-the-kernel GQA fan-out: each kernel block handles ALL `n_q_per_kv`
+// query heads that share one kv-head. This is the same trick the Q8 V
+// output kernel uses — K loads are reused across the qh axis, cutting
+// global memory traffic by a factor of n_q_per_kv (8 for qwen3-coder,
+// 4 for qwen3 base). Without it the kernel re-reads every K block
+// n_q_per_kv times, which is what made the naive version bandwidth-bound.
+//
+// The LAST block (block_idx == full_blocks, when seq_kv % 32 != 0) is the
+// partial residual — positions [full_blocks*32, seq_kv) live in the F16
+// residual buffer, not the Q4 blob. The kernel reads those from
+// `K_residual` instead of the Q4 blob, so scores for the whole valid
+// seq_kv range (full blocks + residual) come from one kernel launch.
+template <int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_score_q4_inner(
+    const void * __restrict__ K_blocks,   // [seq_blocks, n_kv, head_dim] q4_0 cells
+    const half * __restrict__ K_residual, // [n_kv, head_dim, 32] f16 (partial block)
+    const float * __restrict__ Q,         // [n_q_heads, head_dim] f32
+    float * __restrict__ scores,          // [n_q_heads, seq_kv] f32
+    int seq_kv,
+    int full_blocks,
+    int n_kv,
+    int n_q_per_kv,
+    int sb,                               // seq-block index
+    int h_kv,                             // kv head
+    int lane,
+    int warp_id,
+    int n_warps
+) {
+    const int nib_byte = lane & 15;
+    const bool is_high = lane >= 16;
+    const int out_token = sb * 32 + lane;
+    const bool is_partial = (sb == full_blocks);
+
+    // Out-of-range tokens in the last (partial) block skip everything.
+    if (out_token >= seq_kv) {
+        // Still participate in __syncthreads below so the warp reduction
+        // doesn't deadlock. We compute with k_val=0, which contributes 0.
+    }
+
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    for (int c = warp_id; c < HD; c += n_warps) {
+        float k_val;
+        if (is_partial) {
+            // Residual F16 read. Layout is [n_kv, head_dim, 32]: the
+            // `lane` axis directly indexes the slot within the partial
+            // block.
+            const size_t r_idx =
+                (size_t)h_kv * (size_t)HD * 32
+                + (size_t)c * 32
+                + (size_t)lane;
+            k_val = (out_token < seq_kv) ? __half2float(K_residual[r_idx]) : 0.0f;
+        } else {
+            const size_t block_idx =
+                (size_t)sb * ((size_t)n_kv * (size_t)HD)
+                + (size_t)h_kv * (size_t)HD
+                + (size_t)c;
+            const block_q4_0 * k_block =
+                reinterpret_cast<const block_q4_0 *>(K_blocks) + block_idx;
+            const uint8_t byte = k_block->qs[nib_byte];
+            const int nib = is_high ? (byte >> 4) : (byte & 0xF);
+            k_val = (nib - 8) * __half2float(k_block->d);
+        }
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h_q = h_kv * n_q_per_kv + q;
+                const float q_val = Q[(size_t)h_q * HD + c];
+                acc[q] = fmaf(q_val, k_val, acc[q]);
+            }
+        }
+    }
+
+    extern __shared__ float shmem_buf[]; // [n_warps][32]
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem_buf[warp_id * 32 + lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < 32; ++w) {
+                    if (w < n_warps) total += shmem_buf[w * 32 + lane];
+                }
+                if (out_token < seq_kv) {
+                    const int h_q = h_kv * n_q_per_kv + q;
+                    scores[(size_t)h_q * seq_kv + out_token] = total;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_SCORE_Q4_KERNEL(NAME, HD, NQ)                                    \
+extern "C" __global__ void NAME(                                              \
+    const void * __restrict__ K_blocks,                                       \
+    const half * __restrict__ K_residual,                                     \
+    const float * __restrict__ Q,                                             \
+    float * __restrict__ scores,                                              \
+    int seq_kv,                                                               \
+    int full_blocks,                                                          \
+    int n_kv,                                                                 \
+    int /* n_q_per_kv */                                                      \
+) {                                                                           \
+    const int sb   = blockIdx.x;                                              \
+    const int h_kv = blockIdx.y;                                              \
+    const int lane = threadIdx.x;                                             \
+    const int warp = threadIdx.y;                                             \
+    const int n_warps = blockDim.y;                                           \
+    attn_score_q4_inner<HD, NQ>(                                              \
+        K_blocks, K_residual, Q, scores, seq_kv, full_blocks, n_kv, NQ,       \
+        sb, h_kv, lane, warp, n_warps                                         \
+    );                                                                        \
+}
+
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq1,   64, 1)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq2,   64, 2)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq4,   64, 4)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq5,   64, 5)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq8,   64, 8)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq1, 128, 1)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq2, 128, 2)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq4, 128, 4)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq5, 128, 5)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq8, 128, 8)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq1, 256, 1)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq2, 256, 2)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq4, 256, 4)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq5, 256, 5)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq8, 256, 8)
+// HD=512 specializations — for architectures with head_dim 512 global
+// attention layers. The templated kernel scales cleanly with HD (just
+// more channels-per-warp
+// iterations), so this is a pure template instantiation.
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq1, 512, 1)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq2, 512, 2)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq4, 512, 4)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq5, 512, 5)
+ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq8, 512, 8)
+
+// ─────────────────────────────────────────────────────────────────────────
+// Device-position variant of attn_score_q4_*. Reads `seq_kv` from a device
+// tensor instead of a host int, and writes scores into a pre-allocated
+// `[n_q_heads, max_seq_padded]` buffer at the SAME stride every launch.
+// Positions [seq_kv, max_seq_padded) are written as -INFINITY so the
+// downstream softmax masks them out (matches the F-dtype graph-capture
+// path which uses `padded_mask` for the same purpose).
+//
+// Required for CUDA graph capture of Q4-KV decode — the host updates
+// `seq_kv_dev` outside the captured region each token, while the captured
+// kernel uses the same dst pointer + max_seq_padded stride on every replay.
+// ─────────────────────────────────────────────────────────────────────────
+template<int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_score_q4_inner_dev_pos(
+    const void  * __restrict__ K_blocks,
+    const half  * __restrict__ K_residual,
+    const float * __restrict__ Q,
+    float       * __restrict__ scores,        // [n_q_heads * max_seq_padded] f32
+    const int32_t * __restrict__ seq_kv_dev,  // device ptr to current seq len (i32)
+    int max_seq_padded,                       // stride of the scores buffer
+    int n_kv,
+    int n_q_per_kv,
+    int sb, int h_kv, int lane, int warp_id, int n_warps
+) {
+    // Host stores `current_seq_len BEFORE the append` in seq_kv_dev (so
+    // the append/flush kernels can derive slot/block from `pos & 31` and
+    // `pos >> 5`). Attention sees the cache AFTER the append, so we
+    // bump by 1 here.
+    const int seq_kv = seq_kv_dev[0] + 1;
+    const int full_blocks = seq_kv / 32;
+
+    // Fast no-op for blocks entirely beyond `seq_kv`. Under graph capture
+    // the grid is sized to `max_seq_padded / 32` blocks, which is the
+    // model's full context. At small seq_kv the vast majority of those
+    // blocks have no valid positions — skip the warp shuffles + global
+    // reads and just write -INF directly. ATTN_SCORE_WARPS=16 normally;
+    // we only need warp 0 + lane < max_seq_padded for the write.
+    if (sb > full_blocks) {
+        if (warp_id == 0) {
+            const int out_token = sb * 32 + lane;
+            if (out_token < max_seq_padded) {
+                #pragma unroll
+                for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+                    if (q < n_q_per_kv) {
+                        const int h_q = h_kv * n_q_per_kv + q;
+                        scores[(size_t)h_q * (size_t)max_seq_padded + (size_t)out_token]
+                            = -INFINITY;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    const int nib_byte = lane & 15;
+    const bool is_high = lane >= 16;
+    const int out_token = sb * 32 + lane;
+    const bool is_partial = (sb == full_blocks);
+    const bool is_in_range = (out_token < seq_kv);
+
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    for (int c = warp_id; c < HD; c += n_warps) {
+        float k_val;
+        if (is_partial) {
+            const size_t r_idx =
+                (size_t)h_kv * (size_t)HD * 32 + (size_t)c * 32 + (size_t)lane;
+            k_val = is_in_range ? __half2float(K_residual[r_idx]) : 0.0f;
+        } else {
+            const size_t block_idx =
+                (size_t)sb * ((size_t)n_kv * (size_t)HD)
+                + (size_t)h_kv * (size_t)HD
+                + (size_t)c;
+            const block_q4_0 * k_block =
+                reinterpret_cast<const block_q4_0 *>(K_blocks) + block_idx;
+            const uint8_t byte = k_block->qs[nib_byte];
+            const int nib = is_high ? (byte >> 4) : (byte & 0xF);
+            k_val = (nib - 8) * __half2float(k_block->d);
+        }
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h_q = h_kv * n_q_per_kv + q;
+                const float q_val = Q[(size_t)h_q * HD + c];
+                acc[q] = fmaf(q_val, k_val, acc[q]);
+            }
+        }
+    }
+
+    extern __shared__ float shmem_buf[];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem_buf[warp_id * 32 + lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < 32; ++w) {
+                    if (w < n_warps) total += shmem_buf[w * 32 + lane];
+                }
+                const int h_q = h_kv * n_q_per_kv + q;
+                // Always write to a STABLE offset using max_seq_padded as
+                // the stride. Positions ≥ seq_kv get -INFINITY so softmax
+                // ignores them. Valid positions get the real score.
+                const size_t dst_off = (size_t)h_q * (size_t)max_seq_padded + (size_t)out_token;
+                if (out_token < max_seq_padded) {
+                    scores[dst_off] = is_in_range ? total : -INFINITY;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_SCORE_Q4_DEV_POS_KERNEL(NAME, HD, NQ)                            \
+extern "C" __global__ void NAME(                                              \
+    const void  * __restrict__ K_blocks,                                      \
+    const half  * __restrict__ K_residual,                                    \
+    const float * __restrict__ Q,                                             \
+    float       * __restrict__ scores,                                        \
+    const int32_t * __restrict__ seq_kv_dev,                                  \
+    int max_seq_padded,                                                       \
+    int n_kv,                                                                 \
+    int /* n_q_per_kv */                                                      \
+) {                                                                           \
+    const int sb   = blockIdx.x;                                              \
+    const int h_kv = blockIdx.y;                                              \
+    const int lane = threadIdx.x;                                             \
+    const int warp = threadIdx.y;                                             \
+    const int n_warps = blockDim.y;                                           \
+    attn_score_q4_inner_dev_pos<HD, NQ>(                                      \
+        K_blocks, K_residual, Q, scores, seq_kv_dev,                          \
+        max_seq_padded, n_kv, NQ,                                             \
+        sb, h_kv, lane, warp, n_warps                                         \
+    );                                                                        \
+}
+
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq1,    64, 1)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq2,    64, 2)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq4,    64, 4)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq5,    64, 5)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq8,    64, 8)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq1, 128, 1)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq2, 128, 2)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq4, 128, 4)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq5, 128, 5)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq8, 128, 8)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq1, 256, 1)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq2, 256, 2)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq4, 256, 4)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq5, 256, 5)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq8, 256, 8)
+// HD=512 dev-pos variants — for head_dim 512 global attention in graph mode.
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq1, 512, 1)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq2, 512, 2)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq4, 512, 4)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq5, 512, 5)
+ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq8, 512, 8)
+
+// ─────────────────────────────────────────────────────────────────────────
+// Device-position variant of attn_score_q8_*. Same purpose as the Q4 dev_pos
+// kernel above but for the Q8KvCache layout — K stored as block_q8_0 with no
+// per-token residual (Q8 quantises per-token across the head_dim, so every
+// token's K row is fully Q8 from append time).
+//
+// Differences vs the non-dev_pos Q8 attn_score kernels (line 3616+):
+//   - Q is consumed as F32 directly. The non-dev_pos path pre-quantises Q to
+//     Q8_1 outside the kernel via a host-side dev.alloc + quantize_q8_1
+//     dispatch. The host-side alloc isn't graph-safe; F32 input is.
+//   - `seq_kv` is read from a device i32 pointer.
+//   - Scores are written into a fixed `[n_q_heads, max_seq_padded]` buffer.
+//     Positions ≥ seq_kv get -INFINITY so the downstream softmax masks them.
+//
+// Launch contract:
+//   blockDim = (32, n_warps_per_block, 1)
+//   gridDim  = (ceil(max_seq_padded / n_warps_per_block), n_kv_heads, 1)
+//   Each warp computes one (token, h_kv) and emits scores for all
+//   `n_q_per_kv` query heads in that kv-group.
+// ─────────────────────────────────────────────────────────────────────────
+template<int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_score_q8_inner_dev_pos(
+    const void  * __restrict__ K_blocks,
+    const float * __restrict__ Q,
+    float       * __restrict__ scores,
+    const int32_t * __restrict__ seq_kv_dev,
+    int max_seq_padded,
+    int n_kv,
+    int n_q_per_kv,
+    int token,
+    int h_kv,
+    int lane
+) {
+    // Host stores `current_seq_len BEFORE the append` in seq_kv_dev so the
+    // append kernels can derive the destination block index. Attention sees
+    // the cache AFTER the append, so add 1.
+    const int seq_kv = seq_kv_dev[0] + 1;
+
+    if (token >= max_seq_padded) return;
+
+    // Out-of-range: write -INFINITY (original kernel behavior — the
+    // skip-write optimisation broke coherence; keep correct semantics
+    // until a deeper investigation finds the cause).
+    if (token >= seq_kv) {
+        if (lane == 0) {
+            #pragma unroll
+            for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+                if (q < n_q_per_kv) {
+                    const int h_q = h_kv * n_q_per_kv + q;
+                    scores[(size_t)h_q * (size_t)max_seq_padded + (size_t)token]
+                        = -INFINITY;
+                }
+            }
+        }
+        return;
+    }
+
+    constexpr int HD_BLOCKS = HD / 32;
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    // Each lane holds one of 32 head_dim elements within each channel block.
+    // Iterate channel blocks serially; with HD_BLOCKS ≤ 16 (HD ≤ 512) this
+    // unrolls cleanly.
+    #pragma unroll
+    for (int b = 0; b < HD_BLOCKS; ++b) {
+        const size_t block_off =
+            ((size_t)token * (size_t)n_kv + (size_t)h_kv) * (size_t)HD_BLOCKS
+            + (size_t)b;
+        const block_q8_0 * k_block =
+            reinterpret_cast<const block_q8_0 *>(K_blocks) + block_off;
+        const float k_scale = __half2float(k_block->d);
+        const int8_t k_i8   = k_block->qs[lane];
+        const float k_val   = (float)k_i8 * k_scale;
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h_q = h_kv * n_q_per_kv + q;
+                const float q_val = Q[(size_t)h_q * HD + b * 32 + lane];
+                acc[q] = fmaf(q_val, k_val, acc[q]);
+            }
+        }
+    }
+
+    // Warp-reduce: 32 lanes each held HD/32 partial products; after the
+    // butterfly, lane 0 holds the full dot product.
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            float v = acc[q];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_xor_sync(0xffffffff, v, off);
+            }
+            if (lane == 0) {
+                const int h_q = h_kv * n_q_per_kv + q;
+                scores[(size_t)h_q * (size_t)max_seq_padded + (size_t)token] = v;
+            }
+        }
+    }
+}
+
+#define ATTN_SCORE_Q8_DEV_POS_KERNEL(NAME, HD, NQ)                            \
+extern "C" __global__ void NAME(                                              \
+    const void  * __restrict__ K_blocks,                                      \
+    const float * __restrict__ Q,                                             \
+    float       * __restrict__ scores,                                        \
+    const int32_t * __restrict__ seq_kv_dev,                                  \
+    int max_seq_padded,                                                       \
+    int n_kv,                                                                 \
+    int /* n_q_per_kv */                                                      \
+) {                                                                           \
+    const int token = blockIdx.x * blockDim.y + threadIdx.y;                  \
+    const int h_kv  = blockIdx.y;                                             \
+    const int lane  = threadIdx.x;                                            \
+    attn_score_q8_inner_dev_pos<HD, NQ>(                                      \
+        K_blocks, Q, scores, seq_kv_dev,                                      \
+        max_seq_padded, n_kv, NQ,                                             \
+        token, h_kv, lane                                                     \
+    );                                                                        \
+}
+
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq1,    64, 1)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq2,    64, 2)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq4,    64, 4)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq5,    64, 5)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq8,    64, 8)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq1, 128, 1)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq2, 128, 2)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq4, 128, 4)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq5, 128, 5)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq8, 128, 8)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq1, 256, 1)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq2, 256, 2)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq4, 256, 4)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq5, 256, 5)
+ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq8, 256, 8)
+
+// V-path attention output: `out = probs @ V` where:
+//   probs : [n_q_heads, seq_kv]   (f32, softmax output)
+//   V     : [seq_kv, n_kv_heads, head_dim] Q8_0 blocks along head_dim
+//   out   : [n_q_heads, head_dim] (f32)
+//
+// Reduction is along seq_kv (NOT head_dim), but Q8_0 blocks pack along
+// head_dim — so one block spans 32 head_dim elements for a fixed (seq, kv).
+// Each warp owns a (kv, block_idx, qh) triple: 32 lanes cover 32 head_dim
+// outputs, one per lane, and each lane loops over seq_kv scanning its
+// d-column. The block's shared scale `d` loads once per (s, kv, block_idx)
+// iteration and is broadcast via the half-to-float conversion; there's no
+// cross-lane reduction since each lane has an independent output.
+//
+// Launch: gridDim = (head_dim / 32, n_kv_heads, n_q_per_kv),
+//         blockDim = (32, 1, 1). No shared memory needed.
+//
+// Compute bandwidth per output element: seq_kv × (1 i8 + 1/32 f16 scale +
+// 1 f32 probs). For typical qwen3 (n_q_heads=32, head_dim=128, seq_kv=2K):
+// ~33 KB V bytes per block tile × 32 tiles = 1 MB per call — memory-bound
+// and well within <100µs on any modern GPU.
+#define ATTN_OUTPUT_WARPS 32  /* warps/block splitting the seq_kv reduction */
+
+// Per-warp loop that dequantises one V row element + multiplies by each
+// of n_q_per_kv probs values, accumulating into register-resident per-qh
+// accumulators. Pulls V from global memory exactly once per (s, kv,
+// block_idx) — no re-reads across the qh dimension.
+template <int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_output_inner(
+    const void * __restrict__ V_blob,
+    const float * __restrict__ probs,
+    float * __restrict__ out,
+    int seq_kv,
+    int n_kv_stride_blocks,
+    int kv_head_stride_blocks,
+    int n_q_per_kv,
+    int block_idx,
+    int kv,
+    int lane,
+    int warp_id
+) {
+    const int HD_BLOCKS = HD / 32;
+    (void)HD_BLOCKS;
+
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    for (int s = warp_id; s < seq_kv; s += ATTN_OUTPUT_WARPS) {
+        const block_q8_0 * v_block =
+            reinterpret_cast<const block_q8_0 *>(V_blob)
+            + (size_t)s * n_kv_stride_blocks
+            + kv * kv_head_stride_blocks
+            + block_idx;
+        const int8_t v_i8 = v_block->qs[lane];
+        const float v_f = static_cast<float>(v_i8) * __half2float(v_block->d);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h = kv * n_q_per_kv + q;
+                const float p = probs[(size_t)h * seq_kv + s];
+                acc[q] = fmaf(p, v_f, acc[q]);
+            }
+        }
+    }
+
+    __shared__ float shmem[ATTN_OUTPUT_WARPS][32];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem[warp_id][lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < ATTN_OUTPUT_WARPS; ++w) total += shmem[w][lane];
+                const int h = kv * n_q_per_kv + q;
+                const int d = block_idx * 32 + lane;
+                out[(size_t)h * HD + d] = total;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Specialise on exact n_q_per_kv so the `acc[N]` array stays in registers.
+// 1 = MHA / MQA; 4 = qwen3 base GQA 8:1; 8 = qwen3-coder / Llama-3 70B;
+// fallback to a slow dynamic path for anything else.
+#define ATTN_OUTPUT_KERNEL(NAME, HD, NQ)                                     \
+extern "C" __global__ void NAME(                                             \
+    const void * __restrict__ V_blob,                                        \
+    const float * __restrict__ probs,                                        \
+    float * __restrict__ out,                                                \
+    int seq_kv,                                                              \
+    int n_kv_stride_blocks,                                                  \
+    int kv_head_stride_blocks,                                               \
+    int /* n_q_per_kv */                                                     \
+) {                                                                          \
+    const int block_idx = blockIdx.x;                                        \
+    const int kv        = blockIdx.y;                                        \
+    const int lane      = threadIdx.x;                                       \
+    const int warp_id   = threadIdx.y;                                       \
+    if (block_idx >= (HD / 32)) return;                                      \
+    attn_output_inner<HD, NQ>(                                               \
+        V_blob, probs, out, seq_kv,                                          \
+        n_kv_stride_blocks, kv_head_stride_blocks, NQ,                       \
+        block_idx, kv, lane, warp_id                                         \
+    );                                                                       \
+}
+
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq1,   64, 1)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq2,   64, 2)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq4,   64, 4)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq5,   64, 5)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq8,   64, 8)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq1, 128, 1)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq2, 128, 2)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq4, 128, 4)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq5, 128, 5)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq8, 128, 8)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq1, 256, 1)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq2, 256, 2)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq4, 256, 4)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq5, 256, 5)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq8, 256, 8)
+// Gemma4 Global layers (HD=512). Same kernel template; HD/32=16 blocks.
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq1, 512, 1)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq2, 512, 2)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq4, 512, 4)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq5, 512, 5)
+ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq8, 512, 8)
+
+// ─────────────────────────────────────────────────────────────────────────
+// Device-position variant of attn_output_q8_*. Same template as the
+// non-dev_pos kernel but:
+//   - `seq_kv` is read from a device i32 pointer (host updates it outside
+//     the captured region each token).
+//   - `probs` is laid out at the fixed `max_seq_padded` stride. probs[h, s]
+//     for s ≥ seq_kv MUST be zero (the upstream softmax produces this
+//     because attn_score_q8_*_dev_pos writes -INFINITY at those positions).
+// Required for CUDA graph capture of the Q8 decode attention output step.
+// ─────────────────────────────────────────────────────────────────────────
+// 32 warps × 32 threads (1024 threads/block) exceeds register budget on
+// some compute caps for the dev_pos variant — the extra `seq_kv_dev[0]`
+// load + max_seq_padded indexing tip the per-thread reg count above the
+// 64 reg limit that 1024 threads can fit in a 65 KB register file.
+// Halve to 16 warps; the seq_kv reduction still parallelises 16-way.
+#define ATTN_OUTPUT_DEV_POS_WARPS 16
+
+template <int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_output_q8_inner_dev_pos(
+    const void * __restrict__ V_blob,
+    const float * __restrict__ probs,
+    float * __restrict__ out,
+    const int32_t * __restrict__ seq_kv_dev,
+    int max_seq_padded,
+    int n_kv_stride_blocks,
+    int kv_head_stride_blocks,
+    int n_q_per_kv,
+    int block_idx,
+    int kv,
+    int lane,
+    int warp_id
+) {
+    const int seq_kv = seq_kv_dev[0] + 1;
+
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    for (int s = warp_id; s < seq_kv; s += ATTN_OUTPUT_DEV_POS_WARPS) {
+        const block_q8_0 * v_block =
+            reinterpret_cast<const block_q8_0 *>(V_blob)
+            + (size_t)s * n_kv_stride_blocks
+            + kv * kv_head_stride_blocks
+            + block_idx;
+        const int8_t v_i8 = v_block->qs[lane];
+        const float v_f = static_cast<float>(v_i8) * __half2float(v_block->d);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h = kv * n_q_per_kv + q;
+                // probs stride is max_seq_padded (vs seq_kv in non-dev_pos)
+                const float p = probs[(size_t)h * max_seq_padded + (size_t)s];
+                acc[q] = fmaf(p, v_f, acc[q]);
+            }
+        }
+    }
+
+    __shared__ float shmem[ATTN_OUTPUT_DEV_POS_WARPS][32];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem[warp_id][lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < ATTN_OUTPUT_DEV_POS_WARPS; ++w) total += shmem[w][lane];
+                const int h = kv * n_q_per_kv + q;
+                const int d = block_idx * 32 + lane;
+                out[(size_t)h * HD + d] = total;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_OUTPUT_Q8_DEV_POS_KERNEL(NAME, HD, NQ)                          \
+extern "C" __global__ void NAME(                                             \
+    const void * __restrict__ V_blob,                                        \
+    const float * __restrict__ probs,                                        \
+    float * __restrict__ out,                                                \
+    const int32_t * __restrict__ seq_kv_dev,                                 \
+    int max_seq_padded,                                                      \
+    int n_kv_stride_blocks,                                                  \
+    int kv_head_stride_blocks                                                \
+) {                                                                          \
+    const int block_idx = blockIdx.x;                                        \
+    const int kv        = blockIdx.y;                                        \
+    const int lane      = threadIdx.x;                                       \
+    const int warp_id   = threadIdx.y;                                       \
+    if (block_idx >= (HD / 32)) return;                                      \
+    attn_output_q8_inner_dev_pos<HD, NQ>(                                    \
+        V_blob, probs, out, seq_kv_dev,                                      \
+        max_seq_padded,                                                      \
+        n_kv_stride_blocks, kv_head_stride_blocks, NQ,                       \
+        block_idx, kv, lane, warp_id                                         \
+    );                                                                       \
+}
+
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq1,    64, 1)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq2,    64, 2)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq4,    64, 4)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq5,    64, 5)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq8,    64, 8)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq1, 128, 1)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq2, 128, 2)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq4, 128, 4)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq5, 128, 5)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq8, 128, 8)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq1, 256, 1)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq2, 256, 2)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq4, 256, 4)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq5, 256, 5)
+ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq8, 256, 8)
+
+// ─── Q4_0 V-path attention output ────────────────────────────────────────
+//
+// Mirrors the Q8_0 path above with Q4_0 blocks (18 bytes / 32 elements).
+// V layout is [seq_kv, n_kv, head_dim] of block_q4_0 — same as the Q8 V
+// packing, just half the bytes per block. The kernel structure is
+// identical; only the per-element dequantise changes.
+template <int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_output_q4_inner(
+    const void * __restrict__ V_blob,
+    const float * __restrict__ probs,
+    float * __restrict__ out,
+    int seq_kv,
+    int n_kv_stride_blocks,
+    int kv_head_stride_blocks,
+    int n_q_per_kv,
+    int block_idx,
+    int kv,
+    int lane,
+    int warp_id
+) {
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    // lane in 0..32 addresses one of the 32 dequantised head_dim values of
+    // this block. Q4_0 packs element j into qs[j % 16]: low nibble when
+    // j < 16, high nibble when j >= 16.
+    const int nib_byte = lane & 15;
+    const bool is_high = lane >= 16;
+
+    for (int s = warp_id; s < seq_kv; s += ATTN_OUTPUT_WARPS) {
+        const block_q4_0 * v_block =
+            reinterpret_cast<const block_q4_0 *>(V_blob)
+            + (size_t)s * n_kv_stride_blocks
+            + kv * kv_head_stride_blocks
+            + block_idx;
+        const uint8_t byte = v_block->qs[nib_byte];
+        const int nib = is_high ? (byte >> 4) : (byte & 0xF);
+        const float v_f = (nib - 8) * __half2float(v_block->d);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h = kv * n_q_per_kv + q;
+                const float p = probs[(size_t)h * seq_kv + s];
+                acc[q] = fmaf(p, v_f, acc[q]);
+            }
+        }
+    }
+
+    __shared__ float shmem[ATTN_OUTPUT_WARPS][32];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem[warp_id][lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < ATTN_OUTPUT_WARPS; ++w) total += shmem[w][lane];
+                const int h = kv * n_q_per_kv + q;
+                const int d = block_idx * 32 + lane;
+                out[(size_t)h * HD + d] = total;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_OUTPUT_Q4_KERNEL(NAME, HD, NQ)                                  \
+extern "C" __global__ void NAME(                                             \
+    const void * __restrict__ V_blob,                                        \
+    const float * __restrict__ probs,                                        \
+    float * __restrict__ out,                                                \
+    int seq_kv,                                                              \
+    int n_kv_stride_blocks,                                                  \
+    int kv_head_stride_blocks,                                               \
+    int /* n_q_per_kv */                                                     \
+) {                                                                          \
+    const int block_idx = blockIdx.x;                                        \
+    const int kv        = blockIdx.y;                                        \
+    const int lane      = threadIdx.x;                                       \
+    const int warp_id   = threadIdx.y;                                       \
+    if (block_idx >= (HD / 32)) return;                                      \
+    attn_output_q4_inner<HD, NQ>(                                            \
+        V_blob, probs, out, seq_kv,                                          \
+        n_kv_stride_blocks, kv_head_stride_blocks, NQ,                       \
+        block_idx, kv, lane, warp_id                                         \
+    );                                                                       \
+}
+
+// ─── Q4_0 V-path attention output (split-K variant) ──────────────────────
+//
+// Same dot product (probs @ V) but with the seq_kv reduction split across
+// many blocks via grid_z. Each block handles a SEQ_PER_SPLIT slice of
+// seq_kv for one (HD chunk, kv head) and atomicAdd's its partial into the
+// pre-zeroed output. Targets the high-ctx regime (>~12k seq_kv) where the
+// monolithic 32-warp kernel under-saturates SMs (~6 warps/SM); the
+// split-K form scales the block count linearly with seq_kv.
+//
+// Kernel parameters:
+//   ATTN_OUTPUT_SPLITK_WARPS  — warps per block (default 8 → 256 threads)
+//   seq_per_split              — runtime, controlled by host (default 256)
+//
+// Grid: (HD/32, n_kv, S) where S = ceil(seq_kv / seq_per_split).
+//
+// Caller MUST pre-zero `out` (cudaMemsetAsync) before launch because the
+// kernel atomicAdd's its partial.
+#define ATTN_OUTPUT_SPLITK_WARPS 8
+
+template <int HD, int MAX_NQ_PER_KV, int WARPS_PER_BLOCK>
+static __device__ __forceinline__ void attn_output_q4_splitk_inner(
+    const void * __restrict__ V_blob,
+    const float * __restrict__ probs,
+    float * __restrict__ out,
+    int seq_kv,
+    int n_kv_stride_blocks,
+    int kv_head_stride_blocks,
+    int n_q_per_kv,
+    int block_idx,
+    int kv,
+    int s_start,
+    int s_end,
+    int lane,
+    int warp_id
+) {
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    const int nib_byte = lane & 15;
+    const bool is_high = lane >= 16;
+
+    // Each warp strides through the [s_start, s_end) range.
+    for (int s = s_start + warp_id; s < s_end; s += WARPS_PER_BLOCK) {
+        const block_q4_0 * v_block =
+            reinterpret_cast<const block_q4_0 *>(V_blob)
+            + (size_t)s * n_kv_stride_blocks
+            + kv * kv_head_stride_blocks
+            + block_idx;
+        const uint8_t byte = v_block->qs[nib_byte];
+        const int nib = is_high ? (byte >> 4) : (byte & 0xF);
+        const float v_f = (nib - 8) * __half2float(v_block->d);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h = kv * n_q_per_kv + q;
+                const float p = probs[(size_t)h * seq_kv + s];
+                acc[q] = fmaf(p, v_f, acc[q]);
+            }
+        }
+    }
+
+    __shared__ float shmem[WARPS_PER_BLOCK][32];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem[warp_id][lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < WARPS_PER_BLOCK; ++w) total += shmem[w][lane];
+                const int h = kv * n_q_per_kv + q;
+                const int d = block_idx * 32 + lane;
+                atomicAdd(&out[(size_t)h * HD + d], total);
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_OUTPUT_Q4_SPLITK_KERNEL(NAME, HD, NQ)                              \
+extern "C" __global__ void NAME(                                                \
+    const void * __restrict__ V_blob,                                           \
+    const float * __restrict__ probs,                                           \
+    float * __restrict__ out,                                                   \
+    int seq_kv,                                                                 \
+    int n_kv_stride_blocks,                                                     \
+    int kv_head_stride_blocks,                                                  \
+    int seq_per_split                                                           \
+) {                                                                             \
+    const int block_idx = blockIdx.x;                                           \
+    const int kv        = blockIdx.y;                                           \
+    const int sb        = blockIdx.z;                                           \
+    const int lane      = threadIdx.x;                                          \
+    const int warp_id   = threadIdx.y;                                          \
+    if (block_idx >= (HD / 32)) return;                                         \
+    const int s_start = sb * seq_per_split;                                     \
+    const int s_end   = min(s_start + seq_per_split, seq_kv);                   \
+    if (s_start >= s_end) return;                                               \
+    attn_output_q4_splitk_inner<HD, NQ, ATTN_OUTPUT_SPLITK_WARPS>(              \
+        V_blob, probs, out, seq_kv,                                             \
+        n_kv_stride_blocks, kv_head_stride_blocks, NQ,                          \
+        block_idx, kv, s_start, s_end, lane, warp_id                            \
+    );                                                                          \
+}
+
+ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd64_nq1,    64, 1)
+ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd64_nq4,    64, 4)
+ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd64_nq8,    64, 8)
+ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd128_nq1, 128, 1)
+ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd128_nq4, 128, 4)
+ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd128_nq8, 128, 8)
+ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd256_nq1, 256, 1)
+ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd256_nq4, 256, 4)
+ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd256_nq8, 256, 8)
+
+// ─── Fused softmax + Q4 attn output ─────────────────────────────────────
+// Eliminates the explicit `softmax_last_dim(scores)` launch + the probs
+// roundtrip. Reads raw `scores` (post-Q@K^T, post-scale), computes per-head
+// softmax stats inline, then folds the multiply with V into the same block
+// pass. Saves ~48 launches/token at decode (one softmax per layer) plus the
+// probs buffer write/read.
+template <int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_output_softmax_q4_inner(
+    const void * __restrict__ V_blob,
+    const float * __restrict__ scores,
+    float * __restrict__ out,
+    int seq_kv,
+    int n_kv_stride_blocks,
+    int kv_head_stride_blocks,
+    int n_q_per_kv,
+    int block_idx,
+    int kv,
+    int lane,
+    int warp_id
+) {
+    // Pass 1: per-h_q softmax max + 1/denom. Each (block_idx, kv) block
+    // redundantly computes for its kv-group's q heads (minor: avoids
+    // cross-block sync). Warp 0 only; thread `lane` handles h_q=lane.
+    __shared__ float s_max[MAX_NQ_PER_KV];
+    __shared__ float s_inv_denom[MAX_NQ_PER_KV];
+    if (warp_id == 0 && lane < n_q_per_kv) {
+        const int h_q = kv * n_q_per_kv + lane;
+        const float * row = scores + (size_t)h_q * (size_t)seq_kv;
+        float m = -INFINITY;
+        for (int t = 0; t < seq_kv; ++t) m = fmaxf(m, row[t]);
+        float d = 0.0f;
+        // __expf: hardware intrinsic (~16× faster, ~2-ULP precision delta —
+        // safe for softmax since input is pre-max-subtracted).
+        for (int t = 0; t < seq_kv; ++t) d += __expf(row[t] - m);
+        s_max[lane] = m;
+        s_inv_denom[lane] = 1.0f / d;
+    }
+    __syncthreads();
+
+    // Pass 2: stream V, fold-in softmax weights.
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    const int nib_byte = lane & 15;
+    const bool is_high = lane >= 16;
+
+    for (int s = warp_id; s < seq_kv; s += ATTN_OUTPUT_WARPS) {
+        const block_q4_0 * v_block =
+            reinterpret_cast<const block_q4_0 *>(V_blob)
+            + (size_t)s * n_kv_stride_blocks
+            + kv * kv_head_stride_blocks
+            + block_idx;
+        const uint8_t byte = v_block->qs[nib_byte];
+        const int nib = is_high ? (byte >> 4) : (byte & 0xF);
+        const float v_f = (nib - 8) * __half2float(v_block->d);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h = kv * n_q_per_kv + q;
+                const float raw = scores[(size_t)h * (size_t)seq_kv + s];
+                const float p = __expf(raw - s_max[q]) * s_inv_denom[q];
+                acc[q] = fmaf(p, v_f, acc[q]);
+            }
+        }
+    }
+
+    // Cross-warp reduction (same as attn_output_q4_inner).
+    __shared__ float shmem[ATTN_OUTPUT_WARPS][32];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem[warp_id][lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < ATTN_OUTPUT_WARPS; ++w) total += shmem[w][lane];
+                const int h = kv * n_q_per_kv + q;
+                const int d = block_idx * 32 + lane;
+                out[(size_t)h * HD + d] = total;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(NAME, HD, NQ)                          \
+extern "C" __global__ void NAME(                                             \
+    const void * __restrict__ V_blob,                                        \
+    const float * __restrict__ scores,                                       \
+    float * __restrict__ out,                                                \
+    int seq_kv,                                                              \
+    int n_kv_stride_blocks,                                                  \
+    int kv_head_stride_blocks,                                               \
+    int /* n_q_per_kv */                                                     \
+) {                                                                          \
+    const int block_idx = blockIdx.x;                                        \
+    const int kv        = blockIdx.y;                                        \
+    const int lane      = threadIdx.x;                                       \
+    const int warp_id   = threadIdx.y;                                       \
+    if (block_idx >= (HD / 32)) return;                                      \
+    attn_output_softmax_q4_inner<HD, NQ>(                                    \
+        V_blob, scores, out, seq_kv,                                         \
+        n_kv_stride_blocks, kv_head_stride_blocks, NQ,                       \
+        block_idx, kv, lane, warp_id                                         \
+    );                                                                       \
+}
+
+// ─── Fused softmax + Q8 attn output ─────────────────────────────────────
+// Q8 sibling of attn_output_softmax_q4. block_q8_0 has 32 int8 values
+// per block (vs Q4's 32 nibbles in 16 bytes), so each lane reads one
+// byte directly — no nibble split needed. Same softmax math.
+//
+// With a Q8 KV cache this replaces 4 launches (scores + scale + softmax
+// + output) with 1, saving 3 launches per layer.
+template <int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_output_softmax_q8_inner(
+    const void * __restrict__ V_blob,
+    const float * __restrict__ scores,
+    float * __restrict__ out,
+    int seq_kv,
+    int n_kv_stride_blocks,
+    int kv_head_stride_blocks,
+    int n_q_per_kv,
+    int block_idx,
+    int kv,
+    int lane,
+    int warp_id
+) {
+    __shared__ float s_max[MAX_NQ_PER_KV];
+    __shared__ float s_inv_denom[MAX_NQ_PER_KV];
+    // Parallel reduction: warp 0 cooperates across 32 lanes for each
+    // h_q row. For a long context (e.g. seq_kv=3000), this drops the row
+    // reduction from ~6000 serial iters to ~94 iters + 5 warp-shuffle
+    // log2(32) steps (the prior single-threaded reduction was the
+    // bottleneck).
+    if (warp_id == 0) {
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h_q = kv * n_q_per_kv + q;
+                const float * row = scores + (size_t)h_q * (size_t)seq_kv;
+                // Pass 1: per-lane max over interleaved chunks.
+                float m_lane = -INFINITY;
+                for (int t = lane; t < seq_kv; t += 32) {
+                    m_lane = fmaxf(m_lane, row[t]);
+                }
+                // Warp reduction for max.
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    m_lane = fmaxf(m_lane, __shfl_xor_sync(0xFFFFFFFFu, m_lane, off));
+                }
+                const float m = m_lane;
+                // Pass 2: per-lane partial denom with broadcast max.
+                // __expf: hardware intrinsic (~16× faster, ~2-ULP precision
+                // delta — safe for softmax since inputs are pre-max-subtracted).
+                float d_lane = 0.0f;
+                for (int t = lane; t < seq_kv; t += 32) {
+                    d_lane += __expf(row[t] - m);
+                }
+                // Warp reduction for sum.
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    d_lane += __shfl_xor_sync(0xFFFFFFFFu, d_lane, off);
+                }
+                if (lane == 0) {
+                    s_max[q] = m;
+                    s_inv_denom[q] = 1.0f / d_lane;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    for (int s = warp_id; s < seq_kv; s += ATTN_OUTPUT_WARPS) {
+        const block_q8_0 * v_block =
+            reinterpret_cast<const block_q8_0 *>(V_blob)
+            + (size_t)s * n_kv_stride_blocks
+            + kv * kv_head_stride_blocks
+            + block_idx;
+        // Q8: one int8 per thread. lane in [0,32) directly indexes qs.
+        const float v_f = (float)v_block->qs[lane] * __half2float(v_block->d);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h = kv * n_q_per_kv + q;
+                const float raw = scores[(size_t)h * (size_t)seq_kv + s];
+                const float p = __expf(raw - s_max[q]) * s_inv_denom[q];
+                acc[q] = fmaf(p, v_f, acc[q]);
+            }
+        }
+    }
+
+    __shared__ float shmem[ATTN_OUTPUT_WARPS][32];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem[warp_id][lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < ATTN_OUTPUT_WARPS; ++w) total += shmem[w][lane];
+                const int h = kv * n_q_per_kv + q;
+                const int d = block_idx * 32 + lane;
+                out[(size_t)h * HD + d] = total;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(NAME, HD, NQ)                          \
+extern "C" __global__ void NAME(                                             \
+    const void * __restrict__ V_blob,                                        \
+    const float * __restrict__ scores,                                       \
+    float * __restrict__ out,                                                \
+    int seq_kv,                                                              \
+    int n_kv_stride_blocks,                                                  \
+    int kv_head_stride_blocks,                                               \
+    int /* n_q_per_kv */                                                     \
+) {                                                                          \
+    const int block_idx = blockIdx.x;                                        \
+    const int kv        = blockIdx.y;                                        \
+    const int lane      = threadIdx.x;                                       \
+    const int warp_id   = threadIdx.y;                                       \
+    if (block_idx >= (HD / 32)) return;                                      \
+    attn_output_softmax_q8_inner<HD, NQ>(                                    \
+        V_blob, scores, out, seq_kv,                                         \
+        n_kv_stride_blocks, kv_head_stride_blocks, NQ,                       \
+        block_idx, kv, lane, warp_id                                         \
+    );                                                                       \
+}
+
+// e.g. qwen2 with n_q=40, n_kv=8 → nq_per_kv=5. Bucket to 8 (next power).
+ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd128_nq8, 128, 8)
+ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd128_nq4, 128, 4)
+ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd128_nq1, 128, 1)
+ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd64_nq8,   64, 8)
+ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd64_nq4,   64, 4)
+ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd64_nq1,   64, 1)
+
+ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd128_nq8, 128, 8)
+ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd128_nq4, 128, 4)
+ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd128_nq1, 128, 1)
+ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd64_nq8,   64, 8)
+ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd64_nq4,   64, 4)
+ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd64_nq1,   64, 1)
+ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd256_nq8, 256, 8)
+ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd256_nq4, 256, 4)
+ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd256_nq1, 256, 1)
+
+// ─────────────────────────────────────────────────────────────────────────
+// Q8 fused scale+softmax+output with device-side seq_kv (dev_pos variant).
+// Combines the 3 separate launches (affine scale, softmax_last_dim, then
+// attn_output_q8_0_f32_dev_pos) into ONE kernel — saves 2 launches per
+// layer per token plus the intermediate probs write/read.
+//
+// Inputs:
+//   - scores: RAW Q·K^T at fixed max_seq_padded stride. Positions
+//             ≥ seq_kv have -INFINITY from attn_score_q8_0_f32_dev_pos.
+//   - V_blob: Q8_0-packed V at [max_seq_padded, n_kv, head_dim] layout.
+//   - scale:  1/√head_dim, applied in-kernel before softmax.
+//   - seq_kv_dev: device i32 holding current_seq_len BEFORE this token's
+//                 append + 1 (read as seq_kv_dev[0]+1, matching the
+//                 score kernel's convention).
+//
+// Output: [n_q_heads, head_dim] f32.
+//
+// Block shape: 16 warps × 32 threads = 512 threads/block. Matches the
+// dev_pos non-fused output kernel — fits phi2's hd=64 register budget
+// where the 32-warp non-dev_pos kernel hits LAUNCH_OUT_OF_RESOURCES.
+// ─────────────────────────────────────────────────────────────────────────
+#define ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS 16
+
+template <int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_softmax_output_q8_inner_dev_pos(
+    const void * __restrict__ V_blob,
+    const float * __restrict__ scores,
+    float * __restrict__ out,
+    const int32_t * __restrict__ seq_kv_dev,
+    int max_seq_padded,
+    int n_kv_stride_blocks,
+    int kv_head_stride_blocks,
+    float scale,
+    int n_q_per_kv,
+    int block_idx,
+    int kv,
+    int lane,
+    int warp_id
+) {
+    const int seq_kv = seq_kv_dev[0] + 1;
+
+    __shared__ float s_max[MAX_NQ_PER_KV];
+    __shared__ float s_inv_denom[MAX_NQ_PER_KV];
+
+    // Warp 0 computes per-q row max + 1/sum(exp(...)) over the valid
+    // [0, seq_kv) range. Padding past seq_kv is -INF in `scores` and
+    // contributes 0 to both max and denom anyway — we still skip those
+    // iterations explicitly to save the loads.
+    if (warp_id == 0) {
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h_q = kv * n_q_per_kv + q;
+                const float * row = scores + (size_t)h_q * (size_t)max_seq_padded;
+                // Pass 1: per-lane max.
+                float m_lane = -INFINITY;
+                for (int t = lane; t < seq_kv; t += 32) {
+                    m_lane = fmaxf(m_lane, row[t] * scale);
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    m_lane = fmaxf(m_lane, __shfl_xor_sync(0xFFFFFFFFu, m_lane, off));
+                }
+                const float m = m_lane;
+                // Pass 2: per-lane partial denom with broadcast max.
+                // __expf: hardware intrinsic, ~16× faster than expf.
+                // Safe here because raw values are pre-subtracted by max so
+                // input <= 0, output in (0, 1]. The ~2-ULP precision delta
+                // is well within softmax's natural noise budget.
+                float d_lane = 0.0f;
+                for (int t = lane; t < seq_kv; t += 32) {
+                    d_lane += __expf(row[t] * scale - m);
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    d_lane += __shfl_xor_sync(0xFFFFFFFFu, d_lane, off);
+                }
+                if (lane == 0) {
+                    s_max[q] = m;
+                    s_inv_denom[q] = 1.0f / d_lane;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // All warps cooperate on the V multiply: each warp owns a stride of
+    // seq positions (warp_id, warp_id + 16, ...). Inside each iteration
+    // we re-read the row's score and apply scale + softmax inline (saves
+    // the global probs buffer write/read from the unfused path).
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    for (int s = warp_id; s < seq_kv; s += ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS) {
+        const block_q8_0 * v_block =
+            reinterpret_cast<const block_q8_0 *>(V_blob)
+            + (size_t)s * n_kv_stride_blocks
+            + kv * kv_head_stride_blocks
+            + block_idx;
+        const float v_f = (float)v_block->qs[lane] * __half2float(v_block->d);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h = kv * n_q_per_kv + q;
+                const float raw = scores[(size_t)h * max_seq_padded + s] * scale;
+                const float p = __expf(raw - s_max[q]) * s_inv_denom[q];
+                acc[q] = fmaf(p, v_f, acc[q]);
+            }
+        }
+    }
+
+    __shared__ float shmem[ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS][32];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem[warp_id][lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS; ++w) total += shmem[w][lane];
+                const int h = kv * n_q_per_kv + q;
+                const int d = block_idx * 32 + lane;
+                out[(size_t)h * HD + d] = total;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(NAME, HD, NQ)                  \
+extern "C" __global__ void NAME(                                             \
+    const void * __restrict__ V_blob,                                        \
+    const float * __restrict__ scores,                                       \
+    float * __restrict__ out,                                                \
+    const int32_t * __restrict__ seq_kv_dev,                                 \
+    int max_seq_padded,                                                      \
+    int n_kv_stride_blocks,                                                  \
+    int kv_head_stride_blocks,                                               \
+    float scale                                                              \
+) {                                                                          \
+    const int block_idx = blockIdx.x;                                        \
+    const int kv        = blockIdx.y;                                        \
+    const int lane      = threadIdx.x;                                       \
+    const int warp_id   = threadIdx.y;                                       \
+    if (block_idx >= (HD / 32)) return;                                      \
+    attn_softmax_output_q8_inner_dev_pos<HD, NQ>(                            \
+        V_blob, scores, out, seq_kv_dev,                                     \
+        max_seq_padded,                                                      \
+        n_kv_stride_blocks, kv_head_stride_blocks,                           \
+        scale, NQ,                                                           \
+        block_idx, kv, lane, warp_id                                         \
+    );                                                                       \
+}
+
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq1,    64, 1)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq2,    64, 2)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq4,    64, 4)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq5,    64, 5)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq8,    64, 8)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq1, 128, 1)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq2, 128, 2)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq4, 128, 4)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq5, 128, 5)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq8, 128, 8)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq1, 256, 1)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq2, 256, 2)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq4, 256, 4)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq5, 256, 5)
+ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq8, 256, 8)
+
+// ─────────────────────────────────────────────────────────────────────────
+// Fully fused single-query attention for Q8 KV cache (phi2-class arches).
+//
+// Combines Q·K^T + scale + online-softmax + V·attn into ONE kernel launch
+// per layer — replaces the existing 2-launch chain
+// (attn_score_q8_0_f32_dev_pos + attn_softmax_output_q8_0_f32_dev_pos).
+//
+// Why: the 2-launch chain materialises a [n_q_heads × max_seq_padded] F32
+// scores tensor (256 KB for head_dim 64 at 4 K ctx). The intermediate
+// allocation + write + read + free shows up in the per-layer time budget
+// as ~5-10 µs. Fusing keeps scores in registers (per-thread) and
+// uses FlashAttention's online-softmax recurrence to fold V·attn inline.
+//
+// Launch contract:
+//   blockDim  = (32, ATTN_FUSED_WARPS, 1)
+//   gridDim   = (1, n_q_heads, 1)   -- one block per query head
+//   shared mem = HD × sizeof(float) (for broadcasting per-token scores)
+//
+// One block handles all `seq_kv` positions for ONE query head. The block's
+// HD threads (1 per head_dim element) each:
+//   - hold Q[h_q][my_d] in a register
+//   - accumulate VKQ[my_d] over seq_kv iterations
+//   - track running max + running sum for softmax normalisation
+//
+// At seq_kv end, each thread writes out[h_q][my_d] = VKQ[my_d] / sum.
+//
+// Restricted to n_q_per_kv=1 (no GQA broadcast). Phi2's head layout
+// satisfies this (n_head == n_kv_head == 32).
+// ─────────────────────────────────────────────────────────────────────────
+#define ATTN_FUSED_WARPS 2   // 2 warps × 32 lanes = 64 threads = HD for phi2
+
+template <int HD>
+static __device__ __forceinline__ void attn_fused_q8_decode_inner_dev_pos(
+    const void  * __restrict__ K_blocks,
+    const void  * __restrict__ V_blocks,
+    const float * __restrict__ Q,
+    float       * __restrict__ out,
+    const int32_t * __restrict__ seq_kv_dev,
+    int max_seq_padded,
+    int n_kv,
+    float scale,
+    int h_q,
+    int tid,
+    int lane,
+    int warp_id
+) {
+    static_assert(HD == 64 || HD == 128, "HD must be 64 or 128 for fused kernel");
+
+    const int seq_kv = seq_kv_dev[0] + 1;
+    if (seq_kv <= 0) return;
+    if (tid >= HD) return;
+
+    // n_q_per_kv = 1: head_q == head_kv.
+    const int h_kv = h_q;
+    constexpr int HD_BLOCKS = HD / 32;
+
+    // Load Q[h_q][tid] into register (single F32 per thread).
+    const float q_my = Q[(size_t)h_q * HD + tid];
+
+    // Online softmax state and VKQ accumulator (per-thread, per-d element).
+    float vkq = 0.0f;
+    float m   = -INFINITY;
+    float s   =  0.0f;
+
+    // Shared buffer to broadcast score from lane 0 → all lanes in block.
+    __shared__ float s_score;
+
+    for (int t = 0; t < seq_kv; ++t) {
+        // ── Q · K[t] ──────────────────────────────────────────────────
+        // Each lane reads its own (block-of-32, lane) element of K[h_kv][t].
+        // Reduce 32 lanes within warp via __shfl_xor, then reduce across
+        // warps via shared mem.
+        const int b = tid / 32;   // HD_BLOCK index
+        const int l = tid & 31;   // lane within block
+        const size_t k_block_off =
+            ((size_t)t * (size_t)n_kv + (size_t)h_kv) * (size_t)HD_BLOCKS
+            + (size_t)b;
+        const block_q8_0 * k_blk = reinterpret_cast<const block_q8_0 *>(K_blocks) + k_block_off;
+        const float k_scale = __half2float(k_blk->d);
+        const float k_val   = (float)k_blk->qs[l] * k_scale;
+        float partial = q_my * k_val;
+
+        // Warp-reduce across 32 lanes.
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(0xffffffff, partial, off);
+        }
+        // Lane 0 of each warp now holds the per-warp partial sum.
+        // Reduce across warps via shared mem.
+        __shared__ float warp_partials[ATTN_FUSED_WARPS];
+        if (lane == 0) warp_partials[warp_id] = partial;
+        __syncthreads();
+        float score = 0.0f;
+        if (warp_id == 0 && lane == 0) {
+            #pragma unroll
+            for (int w = 0; w < ATTN_FUSED_WARPS; ++w) {
+                score += warp_partials[w];
+            }
+            s_score = score * scale;
+        }
+        __syncthreads();
+        score = s_score;
+
+        // ── Online softmax + V accumulation ────────────────────────────
+        // __expf intrinsic: m_new = max(m,score) ensures both inputs to expf
+        // are <= 0, so output is in (0, 1] — bounded range, safe ~2-ULP delta.
+        const float m_new = fmaxf(m, score);
+        const float scale_old = __expf(m - m_new);
+        const float scale_new = __expf(score - m_new);
+        s = s * scale_old + scale_new;
+
+        // Load V[h_kv][t][tid] (F16 cache element).
+        const size_t v_block_off =
+            ((size_t)t * (size_t)n_kv + (size_t)h_kv) * (size_t)HD_BLOCKS
+            + (size_t)b;
+        const block_q8_0 * v_blk = reinterpret_cast<const block_q8_0 *>(V_blocks) + v_block_off;
+        const float v_scale = __half2float(v_blk->d);
+        const float v_val   = (float)v_blk->qs[l] * v_scale;
+
+        vkq = vkq * scale_old + scale_new * v_val;
+        m = m_new;
+    }
+
+    // Final normalisation. s > 0 since at least one score was valid.
+    const float inv_s = (s > 0.0f) ? (1.0f / s) : 0.0f;
+    out[(size_t)h_q * HD + tid] = vkq * inv_s;
+}
+
+#define ATTN_FUSED_Q8_DEV_POS_KERNEL(NAME, HD)                                \
+extern "C" __global__ void NAME(                                              \
+    const void  * __restrict__ K_blocks,                                      \
+    const void  * __restrict__ V_blocks,                                      \
+    const float * __restrict__ Q,                                             \
+    float       * __restrict__ out,                                           \
+    const int32_t * __restrict__ seq_kv_dev,                                  \
+    int max_seq_padded,                                                       \
+    int n_kv,                                                                 \
+    float scale                                                               \
+) {                                                                           \
+    const int h_q     = blockIdx.y;                                           \
+    const int lane    = threadIdx.x;                                          \
+    const int warp_id = threadIdx.y;                                          \
+    const int tid     = warp_id * 32 + lane;                                  \
+    attn_fused_q8_decode_inner_dev_pos<HD>(                                   \
+        K_blocks, V_blocks, Q, out, seq_kv_dev,                               \
+        max_seq_padded, n_kv, scale,                                          \
+        h_q, tid, lane, warp_id                                               \
+    );                                                                        \
+}
+
+ATTN_FUSED_Q8_DEV_POS_KERNEL(attn_fused_q8_decode_dev_pos_hd64,    64)
+ATTN_FUSED_Q8_DEV_POS_KERNEL(attn_fused_q8_decode_dev_pos_hd128, 128)
+
+// ─────────────────────────────────────────────────────────────────────────
+// F-dtype (F16 KV) dev_pos analogues of the Q8 attention kernels above.
+//
+// Purpose: same launch contract as the Q8 dev_pos pair (attn_score +
+// attn_softmax_output) but reads K/V directly as F16 instead of Q8 blocks.
+// Targets head_dim 64, n_q_per_kv 1 models where kv_quant=Off keeps the
+// cache in F-dtype — the standard_attention 4-launch path
+// (matmul + affine + softmax + matmul) dominates per-layer time. This pair
+// cuts that to 2 launches with the same online-softmax math.
+//
+// K/V layout in SpecKvCache: [b=1, n_kv, max_seq, HD] F16 contiguous.
+//   K[h_kv][token][d] index = ((size_t)h_kv * max_seq + token) * HD + d
+// The host call passes `max_seq_padded` = the cache's max_seq_len (full
+// pre-allocated stride). `seq_kv_dev` follows the same +1 convention as
+// the Q8 variant (host stores current_seq_len BEFORE append → +1 here).
+// ─────────────────────────────────────────────────────────────────────────
+
+template<int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_score_f16_inner_dev_pos(
+    const __half * __restrict__ K,
+    const float  * __restrict__ Q,
+    float        * __restrict__ scores,
+    const int32_t * __restrict__ seq_kv_dev,
+    int max_seq_padded,
+    int n_kv,
+    int n_q_per_kv,
+    int token,
+    int h_kv,
+    int lane
+) {
+    const int seq_kv = seq_kv_dev[0] + 1;
+
+    if (token >= max_seq_padded) return;
+
+    if (token >= seq_kv) {
+        if (lane == 0) {
+            #pragma unroll
+            for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+                if (q < n_q_per_kv) {
+                    const int h_q = h_kv * n_q_per_kv + q;
+                    scores[(size_t)h_q * (size_t)max_seq_padded + (size_t)token]
+                        = -INFINITY;
+                }
+            }
+        }
+        return;
+    }
+
+    constexpr int HD_BLOCKS = HD / 32;
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    #pragma unroll
+    for (int b = 0; b < HD_BLOCKS; ++b) {
+        const size_t k_off =
+            ((size_t)h_kv * (size_t)max_seq_padded + (size_t)token) * (size_t)HD
+            + (size_t)b * 32 + (size_t)lane;
+        const float k_val = __half2float(K[k_off]);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h_q = h_kv * n_q_per_kv + q;
+                const float q_val = Q[(size_t)h_q * HD + b * 32 + lane];
+                acc[q] = fmaf(q_val, k_val, acc[q]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            float v = acc[q];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_xor_sync(0xffffffff, v, off);
+            }
+            if (lane == 0) {
+                const int h_q = h_kv * n_q_per_kv + q;
+                scores[(size_t)h_q * (size_t)max_seq_padded + (size_t)token] = v;
+            }
+        }
+    }
+}
+
+#define ATTN_SCORE_F16_DEV_POS_KERNEL(NAME, HD, NQ)                           \
+extern "C" __global__ void NAME(                                              \
+    const __half * __restrict__ K,                                            \
+    const float  * __restrict__ Q,                                            \
+    float        * __restrict__ scores,                                       \
+    const int32_t * __restrict__ seq_kv_dev,                                  \
+    int max_seq_padded,                                                       \
+    int n_kv,                                                                 \
+    int /* n_q_per_kv */                                                      \
+) {                                                                           \
+    const int token = blockIdx.x * blockDim.y + threadIdx.y;                  \
+    const int h_kv  = blockIdx.y;                                             \
+    const int lane  = threadIdx.x;                                            \
+    attn_score_f16_inner_dev_pos<HD, NQ>(                                     \
+        K, Q, scores, seq_kv_dev,                                             \
+        max_seq_padded, n_kv, NQ,                                             \
+        token, h_kv, lane                                                     \
+    );                                                                        \
+}
+
+ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd64_nq1,    64, 1)
+ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd64_nq2,    64, 2)
+ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd64_nq4,    64, 4)
+ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd64_nq8,    64, 8)
+ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd128_nq1, 128, 1)
+ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd128_nq2, 128, 2)
+ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd128_nq4, 128, 4)
+ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd128_nq8, 128, 8)
+ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd256_nq1, 256, 1)
+
+template <int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_softmax_output_f16_inner_dev_pos(
+    const __half * __restrict__ V,
+    const float  * __restrict__ scores,
+    float        * __restrict__ out,
+    const int32_t * __restrict__ seq_kv_dev,
+    int max_seq_padded,
+    int n_kv,
+    float scale,
+    int n_q_per_kv,
+    int block_idx,
+    int kv,
+    int lane,
+    int warp_id
+) {
+    const int seq_kv = seq_kv_dev[0] + 1;
+
+    __shared__ float s_max[MAX_NQ_PER_KV];
+    __shared__ float s_inv_denom[MAX_NQ_PER_KV];
+
+    if (warp_id == 0) {
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h_q = kv * n_q_per_kv + q;
+                const float * row = scores + (size_t)h_q * (size_t)max_seq_padded;
+                float m_lane = -INFINITY;
+                for (int t = lane; t < seq_kv; t += 32) {
+                    m_lane = fmaxf(m_lane, row[t] * scale);
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    m_lane = fmaxf(m_lane, __shfl_xor_sync(0xFFFFFFFFu, m_lane, off));
+                }
+                const float m = m_lane;
+                // __expf intrinsic — safe: input pre-subtracted by max so
+                // <= 0, output bounded in (0, 1].
+                float d_lane = 0.0f;
+                for (int t = lane; t < seq_kv; t += 32) {
+                    d_lane += __expf(row[t] * scale - m);
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    d_lane += __shfl_xor_sync(0xFFFFFFFFu, d_lane, off);
+                }
+                if (lane == 0) {
+                    s_max[q] = m;
+                    s_inv_denom[q] = 1.0f / d_lane;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+
+    for (int s = warp_id; s < seq_kv; s += ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS) {
+        // V[kv][s][block_idx * 32 + lane]
+        const size_t v_off =
+            ((size_t)kv * (size_t)max_seq_padded + (size_t)s) * (size_t)HD
+            + (size_t)block_idx * 32 + (size_t)lane;
+        const float v_f = __half2float(V[v_off]);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h = kv * n_q_per_kv + q;
+                const float raw = scores[(size_t)h * max_seq_padded + s] * scale;
+                const float p = __expf(raw - s_max[q]) * s_inv_denom[q];
+                acc[q] = fmaf(p, v_f, acc[q]);
+            }
+        }
+    }
+
+    __shared__ float shmem[ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS][32];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem[warp_id][lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS; ++w) total += shmem[w][lane];
+                const int h = kv * n_q_per_kv + q;
+                const int d = block_idx * 32 + lane;
+                out[(size_t)h * HD + d] = total;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(NAME, HD, NQ)                 \
+extern "C" __global__ void NAME(                                             \
+    const __half * __restrict__ V,                                           \
+    const float  * __restrict__ scores,                                      \
+    float        * __restrict__ out,                                         \
+    const int32_t * __restrict__ seq_kv_dev,                                 \
+    int max_seq_padded,                                                      \
+    int n_kv,                                                                \
+    float scale                                                              \
+) {                                                                          \
+    const int block_idx = blockIdx.x;                                        \
+    const int kv        = blockIdx.y;                                        \
+    const int lane      = threadIdx.x;                                       \
+    const int warp_id   = threadIdx.y;                                       \
+    if (block_idx >= (HD / 32)) return;                                      \
+    attn_softmax_output_f16_inner_dev_pos<HD, NQ>(                           \
+        V, scores, out, seq_kv_dev,                                          \
+        max_seq_padded, n_kv,                                                \
+        scale, NQ,                                                           \
+        block_idx, kv, lane, warp_id                                         \
+    );                                                                       \
+}
+
+ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd64_nq1,    64, 1)
+ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd64_nq2,    64, 2)
+ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd64_nq4,    64, 4)
+ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd64_nq8,    64, 8)
+ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd128_nq1, 128, 1)
+ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd128_nq2, 128, 2)
+ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd128_nq4, 128, 4)
+ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd128_nq8, 128, 8)
+ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd256_nq1, 256, 1)
+
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq1,   64, 1)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq2,   64, 2)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq4,   64, 4)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq5,   64, 5)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq8,   64, 8)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq1, 128, 1)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq2, 128, 2)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq4, 128, 4)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq5, 128, 5)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq8, 128, 8)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq1, 256, 1)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq2, 256, 2)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq4, 256, 4)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq5, 256, 5)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq8, 256, 8)
+// HD=512 — matching the attn_score_q4 HD=512 set added above.
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq1, 512, 1)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq2, 512, 2)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq4, 512, 4)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq5, 512, 5)
+ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq8, 512, 8)
+
+// ─────────────────────────────────────────────────────────────────────────
+// Device-position variant of attn_output_q4_*. Reads `seq_kv` from a
+// device tensor instead of taking it as a host int, and reads `probs`
+// at a fixed `max_seq_padded` stride (matches the
+// `attn_score_q4_0_f32_kivi_dev_pos_*` scores output, which writes
+// -INFINITY at positions ≥ seq_kv so softmax produces 0 there). Output
+// `out` shape is [n_q_heads, HD] regardless of seq_kv.
+// ─────────────────────────────────────────────────────────────────────────
+template<int HD, int MAX_NQ_PER_KV>
+static __device__ __forceinline__ void attn_output_q4_inner_dev_pos(
+    const void  * __restrict__ V_blob,
+    const float * __restrict__ probs,
+    float       * __restrict__ out,
+    const int32_t * __restrict__ seq_kv_dev,
+    int max_seq_padded,
+    int n_kv_stride_blocks,
+    int kv_head_stride_blocks,
+    int n_q_per_kv,
+    int block_idx, int kv, int lane, int warp_id
+) {
+    // See attn_score_q4_inner_dev_pos: host stores `current_seq_len BEFORE
+    // the append`; attention sees the cache AFTER the append.
+    const int seq_kv = seq_kv_dev[0] + 1;
+    float acc[MAX_NQ_PER_KV];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
+    const int nib_byte = lane & 15;
+    const bool is_high = lane >= 16;
+
+    for (int s = warp_id; s < seq_kv; s += ATTN_OUTPUT_WARPS) {
+        const block_q4_0 * v_block =
+            reinterpret_cast<const block_q4_0 *>(V_blob)
+            + (size_t)s * n_kv_stride_blocks
+            + kv * kv_head_stride_blocks
+            + block_idx;
+        const uint8_t byte = v_block->qs[nib_byte];
+        const int nib = is_high ? (byte >> 4) : (byte & 0xF);
+        const float v_f = (nib - 8) * __half2float(v_block->d);
+
+        #pragma unroll
+        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+            if (q < n_q_per_kv) {
+                const int h = kv * n_q_per_kv + q;
+                // probs uses max_seq_padded stride, not seq_kv
+                const float p = probs[(size_t)h * (size_t)max_seq_padded + (size_t)s];
+                acc[q] = fmaf(p, v_f, acc[q]);
+            }
+        }
+    }
+
+    __shared__ float shmem[ATTN_OUTPUT_WARPS][32];
+    #pragma unroll
+    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
+        if (q < n_q_per_kv) {
+            shmem[warp_id][lane] = acc[q];
+            __syncthreads();
+            if (warp_id == 0) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < ATTN_OUTPUT_WARPS; ++w) total += shmem[w][lane];
+                const int h = kv * n_q_per_kv + q;
+                const int d = block_idx * 32 + lane;
+                out[(size_t)h * HD + d] = total;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define ATTN_OUTPUT_Q4_DEV_POS_KERNEL(NAME, HD, NQ)                            \
+extern "C" __global__ void NAME(                                               \
+    const void  * __restrict__ V_blob,                                         \
+    const float * __restrict__ probs,                                          \
+    float       * __restrict__ out,                                            \
+    const int32_t * __restrict__ seq_kv_dev,                                   \
+    int max_seq_padded,                                                        \
+    int n_kv_stride_blocks,                                                    \
+    int kv_head_stride_blocks,                                                 \
+    int /* n_q_per_kv */                                                       \
+) {                                                                            \
+    const int block_idx = blockIdx.x;                                          \
+    const int kv        = blockIdx.y;                                          \
+    const int lane      = threadIdx.x;                                         \
+    const int warp_id   = threadIdx.y;                                         \
+    if (block_idx >= (HD / 32)) return;                                        \
+    attn_output_q4_inner_dev_pos<HD, NQ>(                                      \
+        V_blob, probs, out, seq_kv_dev, max_seq_padded,                        \
+        n_kv_stride_blocks, kv_head_stride_blocks, NQ,                         \
+        block_idx, kv, lane, warp_id                                           \
+    );                                                                         \
+}
+
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq1,    64, 1)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq2,    64, 2)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq4,    64, 4)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq5,    64, 5)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq8,    64, 8)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq1, 128, 1)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq2, 128, 2)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq4, 128, 4)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq5, 128, 5)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq8, 128, 8)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq1, 256, 1)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq2, 256, 2)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq4, 256, 4)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq5, 256, 5)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq8, 256, 8)
+// HD=512 dev-pos output variants — graph-mode partner for the score kernel set.
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq1, 512, 1)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq2, 512, 2)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq4, 512, 4)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq5, 512, 5)
+ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq8, 512, 8)
+
+// Half-precision input variant. Saves a promote+copy when the source is
+// already in f16 (common for K/V after attention projection in f16 models).
+extern "C" __global__ void quantize_q8_0_f16(const half * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
+    const int ix = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (ix >= kx_padded) {
+        return;
+    }
+
+    const int iy = blockDim.y*blockIdx.y + threadIdx.y;
+
+    const int i_padded = iy*kx_padded + ix;
+
+    block_q8_0 * y = (block_q8_0 *) vy;
+
+    const int ib = i_padded / QK8_0;
+    const int iqs = i_padded % QK8_0;
+
+    const float xi = ix < kx ? __half2float(x[iy*kx + ix]) : 0.0f;
+    float amax = fabsf(xi);
+
+    amax = warp_reduce_max(amax);
+
+    const float d = amax / 127;
+    const float id = amax == 0.0f ? 0.0f : 1.0f / d;
+    const int8_t q = roundf(xi * id);
+
+    y[ib].qs[iqs] = q;
+
+    if (iqs == 0) {
+        y[ib].d = d;
+    }
 }
 
 // Kernels from https://github.com/ggerganov/llama.cpp/blob/master/ggml-cuda/mmq.cu

@@ -95,6 +95,31 @@ __forceinline__ __device__ void dequantize_block_warp(
             dequantize_block_q6_K<T>(quant_in, dequant_out);
             break;
         }
+        case 6: { // q5_0, qk=32, 32 lanes
+            // Block: half d (2B), uint32 qh (4B), uint8 qs[16] (16B).
+            // ggml: y[j]=((qs[j]&0xF)|xh0)-16)*d ; y[j+16]=((qs[j]>>4)|xh1)-16)*d
+            int laneId = threadIdx.x;
+            const half* d_ptr = (const half*)quant_in;
+            half d_val = (laneId == 0) ? *d_ptr : (half)0.0f;
+            d_val = __shfl_sync(0xFFFFFFFF, d_val, 0);
+            float d_f = __half2float(d_val);
+            uint32_t qh;
+            memcpy(&qh, quant_in + 2, 4); // unaligned-safe (22B block stride)
+            const uint8_t* qs = (const uint8_t*)(quant_in + 6);
+            if (laneId < QK5_0) { // 32
+                int j = laneId & 15; // laneId % 16
+                int xq;
+                if (laneId < 16) {
+                    int xh = ((qh >> j) << 4) & 0x10;
+                    xq = (qs[j] & 0x0F) | xh;
+                } else {
+                    int xh = (qh >> (j + 12)) & 0x10;
+                    xq = (qs[j] >> 4) | xh;
+                }
+                dequant_out[laneId] = T((float)(xq - 16) * d_f);
+            }
+            break;
+        }
         default:
             break;
     }
@@ -348,6 +373,14 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             sorted_token_ids, expert_offsets, topk_weights,\
             output, num_experts, topk, size_m, size_n, size_k, gguf_type\
         );\
+    } else if (gguf_type == 6) { /* Q5_0 (block-32, like Q8_0) */ \
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK5_0, block_q5_0, 32><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, expert_offsets, topk_weights,\
+            output, num_experts, topk, size_m, size_n, size_k, gguf_type\
+        );\
     }
 
 
@@ -390,6 +423,9 @@ extern "C" void moe_gemm_gguf_prefill(
         block_size_bytes = sizeof(block_q3_K);
     } else if (gguf_type == 4) {//Q5K: 4,
         block_size_bytes = sizeof(block_q5_K);
+    } else if (gguf_type == 6) {//Q5_0: 6,
+        block_size_bytes = sizeof(block_q5_0);
+        qk = QK5_0;
     }
 
     // 1. A tile: [M_BLK, qk] (dequantized)
